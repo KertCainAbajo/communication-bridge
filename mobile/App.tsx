@@ -5,6 +5,7 @@ import Storage from 'expo-sqlite/kv-store';
 import { useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
+  Linking,
   Platform,
   Pressable,
   ScrollView,
@@ -18,7 +19,8 @@ import bundledContent from './assets/offline/content.json';
 import bisayaPhraseWords from './assets/offline/bisaya-words.json';
 import { offlineSpeech } from './offlineSpeech';
 import { createTranslator } from './translation';
-import { preloadBuiltInVoice, synthesizeWithBuiltInVoice } from './builtInVoice';
+import { normalizeSpeechKey, prepareForEnglishVoice } from './speechText';
+import { checkBuiltInVoiceHealth, isBuiltInVoiceDisabled, synthesizeWithBuiltInVoice } from './builtInVoice';
 
 const apiBaseUrl = (process.env.EXPO_PUBLIC_API_URL ?? 'http://localhost:8000/api').replace(/\/$/, '');
 const apiV1Url = `${apiBaseUrl}/v1`;
@@ -26,6 +28,9 @@ const customWordsStorageKey = 'communication-bridge.custom-words.v1';
 const customCategoriesStorageKey = 'communication-bridge.custom-categories.v1';
 const hiddenMessagesStorageKey = 'communication-bridge.hidden-messages.v1';
 const offlineContentStorageKey = 'communication-bridge.offline-content.v1';
+// Which voice reads Filipino and Bisaya: the phone's own Google voice (natural) or the built-in one.
+const filipinoVoiceStorageKey = 'communication-bridge.filipino-voice.v1';
+type FilipinoVoiceChoice = 'phone' | 'builtin';
 const customCategoryPrefix = 'custom:';
 
 type ApiResponse<T> = {
@@ -288,6 +293,24 @@ export default function App() {
   const [speechDraft, setSpeechDraft] = useState('');
   const [speechError, setSpeechError] = useState<string | null>(null);
   const [speechVoiceInfo, setSpeechVoiceInfo] = useState<string | null>(null);
+  // The phone's Google voice sounds natural like English; the built-in voice works on every phone.
+  const [filipinoVoice, setFilipinoVoice] = useState<FilipinoVoiceChoice>('phone');
+
+  useEffect(() => {
+    void readStoredValue(filipinoVoiceStorageKey).then((value) => {
+      if (value === 'builtin') setFilipinoVoice('builtin');
+    }).catch(() => undefined);
+  }, []);
+
+  const chooseFilipinoVoice = (choice: FilipinoVoiceChoice) => {
+    setFilipinoVoice(choice);
+    void writeStoredValue(filipinoVoiceStorageKey, choice).catch(() => undefined);
+  };
+
+  // Opens Android's text-to-speech settings, where the Google Filipino voice can be downloaded once.
+  const openPhoneVoiceSettings = () => {
+    void Linking.sendIntent('com.android.settings.TTS_SETTINGS').catch(() => Linking.openSettings());
+  };
   const [speechLoading, setSpeechLoading] = useState(false);
   const speechPlayer = useAudioPlayer(null, { downloadFirst: true });
   const [customWords, setCustomWords] = useState<CustomWord[]>([]);
@@ -303,8 +326,13 @@ export default function App() {
   const [customWordError, setCustomWordError] = useState<string | null>(null);
   const [customWordsReady, setCustomWordsReady] = useState(false);
 
+  // Shows a note if the built-in voice crashed on this phone last time (helps find the cause).
   useEffect(() => {
-    preloadBuiltInVoice('fil');
+    let active = true;
+    void checkBuiltInVoiceHealth().then((note) => {
+      if (active && note) setSpeechVoiceInfo(note);
+    }).catch(() => undefined);
+    return () => { active = false; };
   }, []);
 
   useEffect(() => {
@@ -473,7 +501,10 @@ export default function App() {
     setSpeechVoiceInfo(null);
     setLastSpoken(text);
 
-    const bundledAudio = offlineSpeech[`${languageCode}:${text}`];
+    // Natural recordings made with Google's voice (scripts/generate-natural-audio.mjs) come first.
+    const speechKey = normalizeSpeechKey(text);
+    const bundledAudio = offlineSpeech[`${languageCode}:${speechKey}`]
+      ?? (languageCode === 'ceb' ? offlineSpeech[`fil:${speechKey}`] : undefined);
     if (bundledAudio !== undefined) {
       await Speech.stop();
       speechPlayer.replace(bundledAudio);
@@ -484,10 +515,30 @@ export default function App() {
     setSpeechLoading(true);
     try {
       speechPlayer.pause();
+      if (languageCode !== 'en' && filipinoVoice === 'phone' && Platform.OS === 'android') {
+        // The phone's Google Filipino voice: natural like the English voice. Bisaya is read with it too.
+        const voices = await Speech.getAvailableVoicesAsync();
+        const filipinoVoices = voices.filter((voice) => /^(fil|tl)([-_]|$)/i.test(voice.language));
+        console.log('[voice] phone Filipino voices:', filipinoVoices.map((voice) => voice.identifier).join(', ') || 'none');
+        if (await speakWithDeviceVoice(text, speechLanguageAliases.fil)) return;
+      }
+      if (languageCode !== 'en' && Platform.OS === 'android') {
+        // Built-in choice: the phone's English voice reads the Filipino or Bisaya text, so it sounds the
+        // same clear voice as English. Every Android phone has an English voice.
+        const englishText = prepareForEnglishVoice(text, languageCode);
+        if (await speakWithDeviceVoice(englishText, speechLanguageAliases.en)) {
+          setSpeechVoiceInfo((info) => `${info ?? ''} · English voice reading ${selectedLanguage.label}`);
+          return;
+        }
+      }
       if (languageCode !== 'en') {
-        // Built-in Filipino and Bisaya voices inside the app: work on every phone with no setup.
-        const builtInAudio = await synthesizeWithBuiltInVoice(text, languageCode).catch(() => null);
+        // Last resort, for phones with no English voice: the voice inside the app.
+        const builtInAudio = await synthesizeWithBuiltInVoice(text, languageCode, { clearSpeech: true }).catch((error: unknown) => {
+          console.log('[voice] error', String(error));
+          return null;
+        });
         if (builtInAudio) {
+          console.log('[voice] playing', builtInAudio);
           await Speech.stop();
           speechPlayer.replace({ uri: builtInAudio });
           speechPlayer.play();
@@ -495,7 +546,12 @@ export default function App() {
           return;
         }
       }
-      if (await speakWithDeviceVoice(text, speechLanguageAliases[languageCode])) return;
+      if (await speakWithDeviceVoice(text, speechLanguageAliases[languageCode])) {
+        if (languageCode !== 'en' && isBuiltInVoiceDisabled()) {
+          setSpeechVoiceInfo((info) => `${info ?? ''} · Built-in voice could not start on this phone, so the phone's voice was used.`);
+        }
+        return;
+      }
 
       setSpeechError(Platform.OS === 'web'
         ? `This browser has no ${selectedLanguage.label} voice (computers usually lack one). Test ${selectedLanguage.label} speech on an Android phone.`
@@ -780,6 +836,31 @@ export default function App() {
             </Pressable>
           </View>
           {speechError ? <Text accessibilityRole="alert" style={styles.speechError}>{speechError}</Text> : null}
+          {Platform.OS === 'android' ? (
+            <View style={styles.voiceChoiceBox}>
+              <Text style={styles.voiceChoiceLabel}>FILIPINO &amp; BISAYA VOICE</Text>
+              <View style={styles.voiceChoiceRow}>
+                {([['phone', 'Filipino voice (natural)'], ['builtin', 'English voice']] as const).map(([choice, label]) => (
+                  <Pressable
+                    key={choice}
+                    accessibilityRole="button"
+                    accessibilityState={{ selected: filipinoVoice === choice }}
+                    onPress={() => chooseFilipinoVoice(choice)}
+                    style={[styles.voiceChoiceButton, filipinoVoice === choice && styles.voiceChoiceButtonActive]}
+                  >
+                    <Text style={[styles.voiceChoiceText, filipinoVoice === choice && styles.voiceChoiceTextActive]}>{label}</Text>
+                  </Pressable>
+                ))}
+              </View>
+              {filipinoVoice === 'phone' ? (
+                <Text style={styles.voiceChoiceHint}>
+                  If Filipino sounds like English, download the Filipino voice once:{' '}
+                  <Text style={styles.voiceChoiceLink} onPress={openPhoneVoiceSettings}>Set up phone voice</Text>
+                  {' '}› Google › Install voice data › Filipino. It then works without internet.
+                </Text>
+              ) : null}
+            </View>
+          ) : null}
           {speechVoiceInfo ? <Text style={styles.apiHint}>{speechVoiceInfo}</Text> : null}
         </View>
 
@@ -1172,6 +1253,15 @@ const styles = StyleSheet.create({
   errorTitle: { color: '#991b1b', fontSize: 16, fontWeight: '800', marginBottom: 6 },
   errorText: { color: '#64748b', fontSize: 13, lineHeight: 19 },
   apiHint: { color: '#8793a5', fontSize: 11, marginTop: 10 },
+  voiceChoiceBox: { marginTop: 12, gap: 7 },
+  voiceChoiceLabel: { color: '#6b778a', fontSize: 10, fontWeight: '800', letterSpacing: 0.8 },
+  voiceChoiceRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 7 },
+  voiceChoiceButton: { backgroundColor: '#f1f5f9', borderColor: '#dce4ef', borderWidth: 1, borderRadius: 16, paddingHorizontal: 12, paddingVertical: 7 },
+  voiceChoiceButtonActive: { backgroundColor: '#eaf0ff', borderColor: '#2563eb' },
+  voiceChoiceText: { color: '#526074', fontSize: 12, fontWeight: '700' },
+  voiceChoiceTextActive: { color: '#1d4ed8', fontWeight: '800' },
+  voiceChoiceHint: { color: '#6b778a', fontSize: 11, lineHeight: 16 },
+  voiceChoiceLink: { color: '#1d4ed8', fontWeight: '800', textDecorationLine: 'underline' },
   retryButton: { alignSelf: 'flex-start', backgroundColor: '#2563eb', borderRadius: 10, paddingHorizontal: 16, paddingVertical: 10, marginTop: 16 },
   retryButtonText: { color: '#fff', fontSize: 13, fontWeight: '800' },
   emptyIcon: { fontSize: 36 },

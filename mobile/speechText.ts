@@ -4,6 +4,12 @@
 
 export type LocalVoice = 'fil' | 'ceb';
 
+// Key for looking up natural recordings: ignores capitals, extra spaces and a final period.
+// Must match normalizeSpeechKey() in scripts/generate-natural-audio.mjs.
+export function normalizeSpeechKey(text: string): string {
+  return text.toLocaleLowerCase().replace(/\s+/g, ' ').trim().replace(/[.!?]+$/, '');
+}
+
 const ones: Record<LocalVoice, string[]> = {
   fil: ['sero', 'isa', 'dalawa', 'tatlo', 'apat', 'lima', 'anim', 'pito', 'walo', 'siyam'],
   ceb: ['sero', 'usa', 'duha', 'tulo', 'upat', 'lima', 'unom', 'pito', 'walo', 'siyam'],
@@ -78,6 +84,18 @@ export function prepareForSpeech(text: string, voice: LocalVoice): string {
     .replace(/\d{1,3}(?:,\d{3})+|\d+/g, (match) => numberToWords(Number(match.replace(/,/g, '')), voice))
     // English words respelled; Filipino and Bisaya words are left as they are.
     .replace(/[A-Za-z']+/g, (word) => englishLoanwords[word.toLowerCase()] ?? word)
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// Filipino and Bisaya read by the phone's English voice (the built-in voice choice). Tested: the
+// English voice is understood best when it reads the normal spelling, so only short forms and
+// numbers are written out.
+export function prepareForEnglishVoice(text: string, voice: LocalVoice): string {
+  return text
+    .replace(/\bmga\b/gi, 'manga')
+    .replace(/\bng\b/gi, 'nang')
+    .replace(/\d{1,3}(?:,\d{3})+|\d+/g, (match) => numberToWords(Number(match.replace(/,/g, '')), voice))
     .replace(/\s+/g, ' ')
     .trim();
 }

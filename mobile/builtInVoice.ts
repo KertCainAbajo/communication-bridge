@@ -2,8 +2,18 @@
 // See builtInVoice.android.ts. Returning null makes the app use the device's own voice instead.
 export type BuiltInVoice = 'fil' | 'ceb';
 
-export async function synthesizeWithBuiltInVoice(_text: string, _voice: BuiltInVoice): Promise<string | null> {
+export async function synthesizeWithBuiltInVoice(
+  _text: string,
+  _voice: BuiltInVoice,
+  _options: { clearSpeech?: boolean } = {},
+): Promise<string | null> {
   return null;
 }
 
-export function preloadBuiltInVoice(_voice: BuiltInVoice): void {}
+export async function checkBuiltInVoiceHealth(): Promise<string | null> {
+  return null;
+}
+
+export function isBuiltInVoiceDisabled(): boolean {
+  return false;
+}
