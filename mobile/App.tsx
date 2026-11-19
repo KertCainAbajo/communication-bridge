@@ -5,7 +5,6 @@ import Storage from 'expo-sqlite/kv-store';
 import { useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
-  Linking,
   Platform,
   Pressable,
   ScrollView,
@@ -20,7 +19,7 @@ import bisayaPhraseWords from './assets/offline/bisaya-words.json';
 import { offlineSpeech } from './offlineSpeech';
 import { createTranslator } from './translation';
 import { normalizeSpeechKey, prepareForEnglishVoice } from './speechText';
-import { checkBuiltInVoiceHealth, isBuiltInVoiceDisabled, synthesizeWithBuiltInVoice } from './builtInVoice';
+import { checkBuiltInVoiceHealth, synthesizeWithBuiltInVoice } from './builtInVoice';
 
 const apiBaseUrl = (process.env.EXPO_PUBLIC_API_URL ?? 'http://localhost:8000/api').replace(/\/$/, '');
 const apiV1Url = `${apiBaseUrl}/v1`;
@@ -98,6 +97,9 @@ const speechLanguageAliases: Record<SpeechVoice, string[]> = {
 };
 
 const voiceLabels: Record<SpeechVoice, string> = { en: 'English', fil: 'Filipino', ceb: 'Bisaya' };
+
+// Indonesian voices read Filipino and Bisaya spelling with nearly the right sounds.
+const indonesianVoiceAliases = ['id-id', 'id', 'in-id', 'in'];
 
 const initialContent = bundledContent as unknown as OfflineContent;
 
@@ -292,7 +294,6 @@ export default function App() {
   const [lastSpoken, setLastSpoken] = useState('');
   const [speechDraft, setSpeechDraft] = useState('');
   const [speechError, setSpeechError] = useState<string | null>(null);
-  const [speechVoiceInfo, setSpeechVoiceInfo] = useState<string | null>(null);
   // The phone's Google voice sounds natural like English; the built-in voice works on every phone.
   const [filipinoVoice, setFilipinoVoice] = useState<FilipinoVoiceChoice>('phone');
 
@@ -307,10 +308,6 @@ export default function App() {
     void writeStoredValue(filipinoVoiceStorageKey, choice).catch(() => undefined);
   };
 
-  // Opens Android's text-to-speech settings, where the Google Filipino voice can be downloaded once.
-  const openPhoneVoiceSettings = () => {
-    void Linking.sendIntent('com.android.settings.TTS_SETTINGS').catch(() => Linking.openSettings());
-  };
   const [speechLoading, setSpeechLoading] = useState(false);
   const speechPlayer = useAudioPlayer(null, { downloadFirst: true });
   const [customWords, setCustomWords] = useState<CustomWord[]>([]);
@@ -326,13 +323,9 @@ export default function App() {
   const [customWordError, setCustomWordError] = useState<string | null>(null);
   const [customWordsReady, setCustomWordsReady] = useState(false);
 
-  // Shows a note if the built-in voice crashed on this phone last time (helps find the cause).
+  // Records whether the built-in voice crashed last time, so it can be switched off safely.
   useEffect(() => {
-    let active = true;
-    void checkBuiltInVoiceHealth().then((note) => {
-      if (active && note) setSpeechVoiceInfo(note);
-    }).catch(() => undefined);
-    return () => { active = false; };
+    void checkBuiltInVoiceHealth().catch(() => undefined);
   }, []);
 
   useEffect(() => {
@@ -469,11 +462,6 @@ export default function App() {
   const speakWithDeviceVoice = async (text: string, aliases: string[]): Promise<boolean> => {
     const voices = await Speech.getAvailableVoicesAsync();
     const voice = findDeviceVoice(voices, aliases);
-    const matchingVoiceCount = voices.filter((item) =>
-      aliases.some((alias) => normalizeVoiceLocale(item.language).startsWith(alias))).length;
-    setSpeechVoiceInfo(voice
-      ? `Voice used: ${voice.name || voice.identifier} (${voice.language}) · ${matchingVoiceCount} matching of ${voices.length} voices on this phone`
-      : `No matching voice · ${voices.length} voices on this phone`);
     if (!voice) return false;
 
     await Speech.stop();
@@ -498,7 +486,6 @@ export default function App() {
       : requestedVoice;
     const selectedLanguage = { label: voiceLabels[languageCode] };
     setSpeechError(null);
-    setSpeechVoiceInfo(null);
     setLastSpoken(text);
 
     // Natural recordings made with Google's voice (scripts/generate-natural-audio.mjs) come first.
@@ -523,13 +510,13 @@ export default function App() {
         if (await speakWithDeviceVoice(text, speechLanguageAliases.fil)) return;
       }
       if (languageCode !== 'en' && Platform.OS === 'android') {
-        // Built-in choice: the phone's English voice reads the Filipino or Bisaya text, so it sounds the
-        // same clear voice as English. Every Android phone has an English voice.
-        const englishText = prepareForEnglishVoice(text, languageCode);
-        if (await speakWithDeviceVoice(englishText, speechLanguageAliases.en)) {
-          setSpeechVoiceInfo((info) => `${info ?? ''} · English voice reading ${selectedLanguage.label}`);
-          return;
-        }
+        // Clear voice: Google's Indonesian voice reads Filipino and Bisaya with nearly the right sounds
+        // (Indonesian uses the same spelling rules: a e i o u, hard g, ng). Without it, the English voice.
+        const spokenText = prepareForEnglishVoice(text, languageCode);
+        const voices = await Speech.getAvailableVoicesAsync();
+        console.log('[voice] phone Indonesian voices:', voices.filter((voice) => /^id([-_]|$)/i.test(voice.language)).map((voice) => voice.identifier).join(', ') || 'none');
+        if (await speakWithDeviceVoice(spokenText, indonesianVoiceAliases)) return;
+        if (await speakWithDeviceVoice(spokenText, speechLanguageAliases.en)) return;
       }
       if (languageCode !== 'en') {
         // Last resort, for phones with no English voice: the voice inside the app.
@@ -542,16 +529,10 @@ export default function App() {
           await Speech.stop();
           speechPlayer.replace({ uri: builtInAudio });
           speechPlayer.play();
-          setSpeechVoiceInfo(`Voice used: built-in ${selectedLanguage.label} voice`);
           return;
         }
       }
-      if (await speakWithDeviceVoice(text, speechLanguageAliases[languageCode])) {
-        if (languageCode !== 'en' && isBuiltInVoiceDisabled()) {
-          setSpeechVoiceInfo((info) => `${info ?? ''} · Built-in voice could not start on this phone, so the phone's voice was used.`);
-        }
-        return;
-      }
+      if (await speakWithDeviceVoice(text, speechLanguageAliases[languageCode])) return;
 
       setSpeechError(Platform.OS === 'web'
         ? `This browser has no ${selectedLanguage.label} voice (computers usually lack one). Test ${selectedLanguage.label} speech on an Android phone.`
@@ -774,28 +755,6 @@ export default function App() {
           </View>
         </View>
 
-        <View style={styles.languageRow}>
-          <Text style={styles.sectionLabel}>LANGUAGE</Text>
-          <View style={styles.languageOptions}>
-            {languages.map((item) => {
-              const active = item.code === language;
-              return (
-                <Pressable
-                  key={item.code}
-                  accessibilityRole="button"
-                  accessibilityState={{ selected: active }}
-                  onPress={() => setLanguage(item.code)}
-                  style={[styles.languageButton, active && styles.languageButtonActive]}
-                >
-                  <Text style={[styles.languageButtonText, active && styles.languageButtonTextActive]}>
-                    {item.label}
-                  </Text>
-                </Pressable>
-              );
-            })}
-          </View>
-        </View>
-
         <View style={styles.speechComposer}>
           <View style={styles.customHeader}>
             <View style={styles.customHeaderCopy}>
@@ -840,7 +799,7 @@ export default function App() {
             <View style={styles.voiceChoiceBox}>
               <Text style={styles.voiceChoiceLabel}>FILIPINO &amp; BISAYA VOICE</Text>
               <View style={styles.voiceChoiceRow}>
-                {([['phone', 'Filipino voice (natural)'], ['builtin', 'English voice']] as const).map(([choice, label]) => (
+                {([['phone', 'Filipino voice (natural)'], ['builtin', 'Clear voice']] as const).map(([choice, label]) => (
                   <Pressable
                     key={choice}
                     accessibilityRole="button"
@@ -852,16 +811,8 @@ export default function App() {
                   </Pressable>
                 ))}
               </View>
-              {filipinoVoice === 'phone' ? (
-                <Text style={styles.voiceChoiceHint}>
-                  If Filipino sounds like English, download the Filipino voice once:{' '}
-                  <Text style={styles.voiceChoiceLink} onPress={openPhoneVoiceSettings}>Set up phone voice</Text>
-                  {' '}› Google › Install voice data › Filipino. It then works without internet.
-                </Text>
-              ) : null}
             </View>
           ) : null}
-          {speechVoiceInfo ? <Text style={styles.apiHint}>{speechVoiceInfo}</Text> : null}
         </View>
 
         <View style={styles.searchBox}>
@@ -880,6 +831,28 @@ export default function App() {
               <Text style={styles.clearSearch}>×</Text>
             </Pressable>
           ) : null}
+        </View>
+
+        <View style={styles.languageRow}>
+          <Text style={styles.sectionLabel}>LANGUAGE</Text>
+          <View style={styles.languageOptions}>
+            {languages.map((item) => {
+              const active = item.code === language;
+              return (
+                <Pressable
+                  key={item.code}
+                  accessibilityRole="button"
+                  accessibilityState={{ selected: active }}
+                  onPress={() => setLanguage(item.code)}
+                  style={[styles.languageButton, active && styles.languageButtonActive]}
+                >
+                  <Text style={[styles.languageButtonText, active && styles.languageButtonTextActive]}>
+                    {item.label}
+                  </Text>
+                </Pressable>
+              );
+            })}
+          </View>
         </View>
 
         <View style={styles.sectionHeader}>
@@ -1260,8 +1233,6 @@ const styles = StyleSheet.create({
   voiceChoiceButtonActive: { backgroundColor: '#eaf0ff', borderColor: '#2563eb' },
   voiceChoiceText: { color: '#526074', fontSize: 12, fontWeight: '700' },
   voiceChoiceTextActive: { color: '#1d4ed8', fontWeight: '800' },
-  voiceChoiceHint: { color: '#6b778a', fontSize: 11, lineHeight: 16 },
-  voiceChoiceLink: { color: '#1d4ed8', fontWeight: '800', textDecorationLine: 'underline' },
   retryButton: { alignSelf: 'flex-start', backgroundColor: '#2563eb', borderRadius: 10, paddingHorizontal: 16, paddingVertical: 10, marginTop: 16 },
   retryButtonText: { color: '#fff', fontSize: 13, fontWeight: '800' },
   emptyIcon: { fontSize: 36 },
