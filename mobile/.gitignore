@@ -40,3 +40,6 @@ yarn-error.*
 # generated native folders
 /ios
 /android
+
+# Offline voice model (download with `node scripts/download-voice-model.mjs`)
+native-assets/models/

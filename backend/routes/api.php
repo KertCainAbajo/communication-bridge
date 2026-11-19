@@ -5,6 +5,7 @@ use App\Http\Controllers\Api\V1\CategoryController;
 use App\Http\Controllers\Api\V1\HealthController;
 use App\Http\Controllers\Api\V1\LanguageController;
 use App\Http\Controllers\Api\V1\MessageController;
+use App\Http\Controllers\Api\V1\SpeechController;
 use App\Http\Controllers\Api\V1\SyncController;
 use App\Http\Controllers\Api\V1\TranslationController;
 use Illuminate\Support\Facades\Route;
@@ -18,6 +19,14 @@ Route::get('/health', function () {
 
 Route::prefix('v1')->name('api.v1.')->group(function (): void {
     Route::get('/health', HealthController::class)->name('health');
+
+    Route::post('/speech', [SpeechController::class, 'synthesize'])
+        ->middleware('throttle:speech')
+        ->name('speech.synthesize');
+    Route::get('/speech/audio/{token}', [SpeechController::class, 'audio'])
+        ->whereUuid('token')
+        ->middleware('signed:relative')
+        ->name('speech.audio');
 
     Route::get('/sync', SyncController::class)->name('sync');
 

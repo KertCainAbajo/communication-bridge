@@ -29,5 +29,9 @@ class AppServiceProvider extends ServiceProvider
             return Limit::perMinute((int) config('communication.api_rate_limit', 600))
                 ->by($request->ip() ?? 'unknown');
         });
+
+        RateLimiter::for('speech', function (Request $request): Limit {
+            return Limit::perMinute(10)->by($request->ip() ?? 'unknown');
+        });
     }
 }
