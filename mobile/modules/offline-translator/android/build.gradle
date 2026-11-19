@@ -1,0 +1,20 @@
+plugins {
+  id 'com.android.library'
+  id 'expo-module-gradle-plugin'
+}
+
+group = 'ph.communicationbridge'
+version = '1.0.0'
+
+android {
+  namespace "expo.modules.offlinetranslator"
+  defaultConfig {
+    versionCode 1
+    versionName "1.0.0"
+  }
+}
+
+dependencies {
+  // Google ML Kit on-device translation (free). Language packs (~30 MB each) download once, then work offline.
+  implementation 'com.google.mlkit:translate:17.0.3'
+}

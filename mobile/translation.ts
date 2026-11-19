@@ -68,6 +68,8 @@ const glossary: [string, string][] = [
   ['good night', 'magandang gabi'], ['i love you', 'mahal kita'], ['more', 'pa'], ['again', 'ulit'],
   ['finished', 'tapos na'], ['done', 'tapos na'], ['all done', 'tapos na'], ['wait for me', 'hintayin mo ako'],
   ['come here', 'halika'], ['let\'s go', 'tara na'], ['excuse me', 'makikiraan po'],
+  ['go home', 'umuwi'], ['go to school', 'pumasok sa paaralan'], ['go out', 'lumabas'], ['go to the bathroom', 'pumunta sa banyo'],
+  ['take a rest', 'magpahinga'], ['watch tv', 'manood ng tv'], ['ice cream', 'ice cream'],
   // Colours
   ['red', 'pula'], ['blue', 'asul'], ['green', 'berde'], ['yellow', 'dilaw'], ['white', 'puti'], ['black', 'itim'],
   ['pink', 'rosas'], ['brown', 'kayumanggi'],
@@ -83,15 +85,23 @@ for (const [english, filipino] of glossary) {
 }
 
 // Simple sentence frames common on communication boards. {x} must itself be translatable.
-const sentencePatterns: { en: RegExp; fil: RegExp; toEn: (x: string) => string; toFil: (x: string) => string }[] = [
-  { en: /^i want (?:a |an |the |some )?(.+)$/, fil: /^gusto ko (?:ng |ang )?(.+)$/, toEn: (x) => `I want ${x}`, toFil: (x) => `Gusto ko ng ${x}` },
-  { en: /^i need (?:a |an |the |some )?(.+)$/, fil: /^kailangan ko (?:ng |ang )?(.+)$/, toEn: (x) => `I need ${x}`, toFil: (x) => `Kailangan ko ng ${x}` },
-  { en: /^i don'?t want (?:a |an |the |some )?(.+)$/, fil: /^ayoko (?:ng |ang )?(.+)$/, toEn: (x) => `I don't want ${x}`, toFil: (x) => `Ayoko ng ${x}` },
-  { en: /^i like (?:a |an |the )?(.+)$/, fil: /^gusto ko ang (.+)$/, toEn: (x) => `I like ${x}`, toFil: (x) => `Gusto ko ang ${x}` },
-  { en: /^where is (?:my |the )?(.+)$/, fil: /^nasaan (?:ang |si )?(.+)$/, toEn: (x) => `Where is ${x}`, toFil: (x) => `Nasaan ang ${x}` },
-  { en: /^my (.+) hurts$/, fil: /^masakit ang (.+) ko$/, toEn: (x) => `My ${x} hurts`, toFil: (x) => `Masakit ang ${x} ko` },
-  { en: /^i am (.+)$/, fil: /^(.+) ako$/, toEn: (x) => `I am ${x}`, toFil: (x) => `${x} ako` },
-  { en: /^i'?m (.+)$/, fil: /^(.+) ako$/, toEn: (x) => `I am ${x}`, toFil: (x) => `${x} ako` },
+// keepUnknown: an unknown word there is usually a thing or a name (food, place, brand, person), which
+// Filipinos keep as it is ("Gusto ko ng ice cream"), so it is kept instead of giving up.
+const sentencePatterns: {
+  en: RegExp; fil: RegExp; toEn: (x: string) => string; toFil: (x: string) => string; keepUnknown: boolean;
+}[] = [
+  { en: /^i want to (.+)$/, fil: /^gusto kong (.+)$/, toEn: (x) => `I want to ${x}`, toFil: (x) => `Gusto kong ${x}`, keepUnknown: false },
+  { en: /^i want (?:a |an |the |some |my )?(.+)$/, fil: /^gusto ko (?:ng |ang )?(.+)$/, toEn: (x) => `I want ${x}`, toFil: (x) => `Gusto ko ng ${x}`, keepUnknown: true },
+  { en: /^i need to (.+)$/, fil: /^kailangan kong (.+)$/, toEn: (x) => `I need to ${x}`, toFil: (x) => `Kailangan kong ${x}`, keepUnknown: false },
+  { en: /^i need (?:a |an |the |some |my )?(.+)$/, fil: /^kailangan ko (?:ng |ang )?(.+)$/, toEn: (x) => `I need ${x}`, toFil: (x) => `Kailangan ko ng ${x}`, keepUnknown: true },
+  { en: /^i don'?t want (?:a |an |the |some |my )?(.+)$/, fil: /^ayoko (?:ng |ang )?(.+)$/, toEn: (x) => `I don't want ${x}`, toFil: (x) => `Ayoko ng ${x}`, keepUnknown: true },
+  { en: /^i like (?:a |an |the )?(.+)$/, fil: /^gusto ko ang (.+)$/, toEn: (x) => `I like ${x}`, toFil: (x) => `Gusto ko ang ${x}`, keepUnknown: true },
+  { en: /^can i (.+)$/, fil: /^pwede ba akong (.+)$/, toEn: (x) => `Can I ${x}`, toFil: (x) => `Pwede ba akong ${x}`, keepUnknown: false },
+  { en: /^let'?s (.+)$/, fil: /^tara,? (.+) tayo$/, toEn: (x) => `Let's ${x}`, toFil: (x) => `Tara, ${x} tayo`, keepUnknown: false },
+  { en: /^where is (?:my |the )?(.+)$/, fil: /^nasaan (?:ang |si )?(.+)$/, toEn: (x) => `Where is ${x}`, toFil: (x) => `Nasaan ang ${x}`, keepUnknown: true },
+  { en: /^my (.+) hurts$/, fil: /^masakit ang (.+) ko$/, toEn: (x) => `My ${x} hurts`, toFil: (x) => `Masakit ang ${x} ko`, keepUnknown: true },
+  { en: /^i am (.+)$/, fil: /^(.+) ako$/, toEn: (x) => `I am ${x}`, toFil: (x) => `${x} ako`, keepUnknown: false },
+  { en: /^i'?m (.+)$/, fil: /^(.+) ako$/, toEn: (x) => `I am ${x}`, toFil: (x) => `${x} ako`, keepUnknown: false },
 ];
 
 function normalize(text: string): string {
@@ -129,6 +139,18 @@ function translateTerm(term: string, dictionary: Map<string, string>): string | 
   return translatedWords.every(Boolean) && words.length <= 3 ? translatedWords.join(' ') : null;
 }
 
+// Only short things or names are kept as they are ("ice cream", "Jollibee"); a longer unknown part is a
+// sentence, which is left to the on-device translator instead.
+function isLikelyName(part: string): boolean {
+  return part.split(' ').length <= 3 && !/^(to|and|but|because|if|when)\b/.test(part);
+}
+
+// The kept word as the person typed it (keeps capitals of names like "Jollibee").
+function originalSpelling(text: string, normalizedWord: string): string {
+  const index = text.toLocaleLowerCase().indexOf(normalizedWord);
+  return index >= 0 ? text.slice(index, index + normalizedWord.length) : normalizedWord;
+}
+
 export function createTranslator(source: PhraseSource) {
   const phraseMaps = {
     'en>fil': buildPhraseMap(source, 'en', 'fil'),
@@ -150,7 +172,9 @@ export function createTranslator(source: PhraseSource) {
 
     for (const pattern of sentencePatterns) {
       const match = normalized.match(from === 'en' ? pattern.en : pattern.fil);
-      const translatedPart = match ? translateTerm(match[1], dictionary) : null;
+      const translatedPart = match
+        ? translateTerm(match[1], dictionary) ?? (pattern.keepUnknown && isLikelyName(match[1]) ? originalSpelling(text, match[1]) : null)
+        : null;
       if (translatedPart) return withEnding(text, from === 'en' ? pattern.toFil(translatedPart) : pattern.toEn(translatedPart));
     }
 

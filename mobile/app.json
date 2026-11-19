@@ -11,7 +11,7 @@
     },
     "android": {
       "adaptiveIcon": {
-        "backgroundColor": "#E6F4FE",
+        "backgroundColor": "#FFFFFF",
         "foregroundImage": "./assets/android-icon-foreground.png",
         "backgroundImage": "./assets/android-icon-background.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"
@@ -25,7 +25,9 @@
     "plugins": [
       "expo-sqlite",
       "expo-audio",
-      "./plugins/with-bundled-voice-model"
+      "./plugins/with-bundled-voice-model",
+      "expo-font",
+      "./plugins/with-release-keep-rules"
     ]
   }
 }
