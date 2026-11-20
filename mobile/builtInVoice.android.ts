@@ -1,6 +1,8 @@
-// Built-in offline voices for the Android app: Meta MMS voices for Filipino (Tagalog), Bisaya (Cebuano)
-// and English (CC BY-NC 4.0), run on the phone by sherpa-onnx. They ship inside the APK
-// (assets/models/vits-mms-*, made by scripts/prepare-mms-voices.py), so they need no internet or setup.
+// Built-in offline voices for the Android app, all women's voices, run on the phone by sherpa-onnx:
+// - Filipino: Meta MMS Tagalog (CC BY-NC 4.0), made higher (see voiceSettings);
+// - Bisaya: Meta MMS Cebuano (CC BY-NC 4.0), a woman's voice already;
+// - English: Piper "Cori" (CC BY 4.0, Hi-Fi TTS dataset by NVIDIA).
+// They ship inside the APK (assets/models/*), so they need no internet or setup.
 //
 // Speed: speech is made in short chunks. Each chunk is saved as a small recording, so anything said
 // before (and anything prepared ahead with prepareBuiltInVoice) plays at once. Only one voice is
@@ -20,9 +22,9 @@ type TtsEngine = Awaited<ReturnType<TtsModule['createTTS']>>;
 const modelFolders: Record<BuiltInVoice, string> = {
   fil: 'models/vits-mms-tgl',
   ceb: 'models/vits-mms-ceb',
-  en: 'models/vits-mms-eng',
+  en: 'models/vits-piper-en-cori',
 };
-const voiceSetName = 'mms-v1';
+const voiceSetName = 'voices-v2';
 
 // Loaded voices, most recently used last. Two are kept (e.g. the board language and Bisaya typed on
 // the Speak screen), so switching between them does not reload; a third frees the oldest.
@@ -140,9 +142,7 @@ function getEngine(tts: TtsModule, voice: BuiltInVoice): Promise<TtsEngine> {
       modelType: 'vits',
       // Up to 4 processor cores (almost every phone since 2016 has at least 4).
       numThreads: 4,
-      // Steadier and slightly slower than MMS's defaults (0.667 / 0.8 / 1.0): in a listening test
-      // (speech recognition on every board phrase) fewer words were misheard.
-      modelOptions: { vits: { noiseScale: mmsNoiseScale, noiseScaleW: mmsNoiseScaleW, lengthScale: mmsLengthScale } },
+      modelOptions: { vits: voiceSettings[voice].vits },
     });
     markStep(null);
     trace(`${voice} loaded`);
@@ -198,18 +198,30 @@ function splitIntoChunks(text: string): Chunk[] {
 }
 
 // Bump when the voices or chunk settings change, so old recordings are not reused.
-const recordingVersion = 'mms3';
+const recordingVersion = 'w4';
 
 // Voice settings (keep the same as scripts/render-board-recordings.py).
-const mmsNoiseScale = 0.35;
-const mmsNoiseScaleW = 0.5;
-const mmsLengthScale = 1.1;
+// MMS: steadier and slightly slower than its defaults (0.667 / 0.8 / 1.0); in a listening test (speech
+// recognition on every board phrase) fewer words were misheard.
+// pitchRaise: the Filipino voice is a man's; it is made slower by this factor and played back faster by
+// the same factor, which keeps the speed but raises the pitch to a woman's (as clear in the same test).
+type VoiceSetting = {
+  vits: { noiseScale: number; noiseScaleW: number; lengthScale: number };
+  pitchRaise: number;
+  // MMS reads letters, not punctuation; Piper (English) uses the punctuation for natural speech.
+  mms: boolean;
+};
+const voiceSettings: Record<BuiltInVoice, VoiceSetting> = {
+  fil: { vits: { noiseScale: 0.35, noiseScaleW: 0.5, lengthScale: 1.1 * 1.45 }, pitchRaise: 1.45, mms: true },
+  ceb: { vits: { noiseScale: 0.35, noiseScaleW: 0.5, lengthScale: 1.1 }, pitchRaise: 1, mms: true },
+  en: { vits: { noiseScale: 0.667, noiseScaleW: 0.8, lengthScale: 1.05 }, pitchRaise: 1, mms: false },
+};
 
-// The text as given to the voice. A trailing " - -" (a pause) stops the voice adding a sound after the
-// last word: the Filipino voice uses the same code for its gaps as for the letter "a", so "tubig"
-// could end as "tubiga". Keep the same as scripts/render-board-recordings.py.
-export function textForVoice(text: string): string {
-  return `${text.replace(/[.,!?;:]+$/, '')} - -`;
+// The text as given to the voice. For MMS a trailing " - -" (a pause) stops the voice adding a sound
+// after the last word: the Filipino voice uses the same code for its gaps as for the letter "a", so
+// "tubig" could end as "tubiga". Keep the same as scripts/render-board-recordings.py.
+export function textForVoice(text: string, voice: BuiltInVoice): string {
+  return voiceSettings[voice].mms ? `${text.replace(/[.,!?;:]+$/, '')} - -` : text;
 }
 
 // Two independent 32-bit hashes, so different chunks never share a recording.
@@ -228,6 +240,38 @@ function chunkPath(fs: FsModule, voice: BuiltInVoice, chunk: Chunk): string {
   return `${fs.CachesDirectoryPath}/${cacheKey(`${chunk.text}|${chunk.pauseSeconds}`, voice)}.wav`;
 }
 
+// Keeps only the words: the voices add a quiet murmur or breath before the first word and after the
+// last one (up to about 0.1 s). Everything quieter than 3% of the loudest part at the two ends is cut,
+// keeping 40 ms of the fade-out, with a short fade so the cut makes no click.
+// Keep the same as trim_to_words in scripts/render-board-recordings.py.
+export function trimToWords(samples: ArrayLike<number>, sampleRate: number): number[] {
+  const window = Math.max(1, Math.round(sampleRate * 0.02));
+  const windows = Math.floor(samples.length / window);
+  if (windows === 0) return Array.from(samples);
+  const energy = new Array<number>(windows);
+  let loudest = 0;
+  for (let w = 0; w < windows; w += 1) {
+    let sum = 0;
+    for (let index = w * window; index < (w + 1) * window; index += 1) sum += samples[index] * samples[index];
+    energy[w] = Math.sqrt(sum / window);
+    loudest = Math.max(loudest, energy[w]);
+  }
+  const threshold = loudest * 0.03;
+  let first = 0;
+  while (first < windows && energy[first] < threshold) first += 1;
+  let last = windows - 1;
+  while (last > first && energy[last] < threshold) last -= 1;
+  const start = Math.max(0, first * window - Math.round(sampleRate * 0.01));
+  const end = Math.min(samples.length, (last + 1) * window + Math.round(sampleRate * 0.04));
+  const kept = Array.from(samples).slice(start, end);
+  const fade = Math.min(Math.round(sampleRate * 0.015), Math.floor(kept.length / 2));
+  for (let index = 0; index < fade; index += 1) {
+    kept[index] *= index / fade;
+    kept[kept.length - 1 - index] *= index / fade;
+  }
+  return kept;
+}
+
 // Makes the recording of one chunk (if it is not saved yet) and returns its path.
 async function makeChunk(modules: { tts: TtsModule; fs: FsModule }, voice: BuiltInVoice, chunk: Chunk): Promise<string> {
   const path = chunkPath(modules.fs, voice, chunk);
@@ -239,12 +283,13 @@ async function makeChunk(modules: { tts: TtsModule; fs: FsModule }, voice: Built
   const engine = await getEngine(modules.tts, voice);
   markStep('speak');
   try {
-    const audio = await engine.generateSpeech(textForVoice(chunk.text));
-    const rate = audio.sampleRate;
+    const audio = await engine.generateSpeech(textForVoice(chunk.text, voice));
+    // Played faster than made for a raised voice (see voiceSettings).
+    const rate = Math.round(audio.sampleRate * voiceSettings[voice].pitchRaise);
     // A little silence first (some phones cut the very start of a sound), the speech at a clear
     // volume, and the pause after. One loop into one list: this runs on the app's main JavaScript
     // thread, so it must be quick (taps wait for it).
-    const spoken = audio.samples;
+    const spoken = trimToWords(audio.samples, audio.sampleRate);
     let peak = 0;
     for (let index = 0; index < spoken.length; index += 1) peak = Math.max(peak, Math.abs(spoken[index]));
     const gain = peak > 0 ? 0.9 / peak : 1;

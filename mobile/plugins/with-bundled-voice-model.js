@@ -1,14 +1,16 @@
-// Expo config plugin: bundles the offline MMS voices (Filipino, Bisaya, English) inside the Android app.
+// Expo config plugin: bundles the offline voices (Filipino and Bisaya: Meta MMS; English: Piper Cori)
+// inside the Android app.
 // Copies only the voices listed below from native-assets/models/ into
 // android/app/src/main/assets/models/ during `expo prebuild` (older voice folders there are left out),
 // and builds only for real-phone CPUs (32- and 64-bit ARM) to keep the APK smaller.
 // Voices are made with scripts/mms-export-onnx.py, then scripts/mms-shrink-weights.py; the app expects
-// each folder to hold model.onnx (the shrunk file) and tokens.txt.
+// each folder to hold model.onnx (the shrunk file) and tokens.txt. The English Piper voice also needs
+// espeak-ng-data (pronunciation rules; only the English files are kept, see scripts/prepare-cori-voice.sh).
 const fs = require('fs');
 const path = require('path');
 const { withDangerousMod, withGradleProperties } = require('expo/config-plugins');
 
-const voices = ['vits-mms-tgl', 'vits-mms-ceb', 'vits-mms-eng'];
+const voices = ['vits-mms-tgl', 'vits-mms-ceb', 'vits-piper-en-cori'];
 
 function withBundledVoiceModel(config) {
   config = withDangerousMod(config, ['android', (modConfig) => {
