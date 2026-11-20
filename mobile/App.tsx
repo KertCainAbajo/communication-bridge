@@ -4,10 +4,12 @@ import { AtkinsonHyperlegible_400Regular, AtkinsonHyperlegible_700Bold, useFonts
 import { useAudioPlayer, useAudioPlayerStatus } from 'expo-audio';
 import * as Speech from 'expo-speech';
 import Storage from 'expo-sqlite/kv-store';
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { type ComponentRef, memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  Alert,
   Dimensions,
+  PixelRatio,
   Image,
   Platform,
   Pressable,
@@ -25,6 +27,7 @@ import { offlineSpeech } from './offlineSpeech';
 import { createTranslator } from './translation';
 import { normalizeSpeechKey, prepareForEnglishVoice } from './speechText';
 import { evenLines, SignWord } from './signLanguage';
+import { navigationBarHeight } from './modules/system-insets';
 import { FadeIn, SlideUp, Toast, type ToastMessage } from './motion';
 import { downloadTranslator, isTranslatorAvailable, isTranslatorReady, translateOffline } from './modules/offline-translator';
 import { checkBuiltInVoiceHealth, synthesizeWithBuiltInVoice } from './builtInVoice';
@@ -281,7 +284,19 @@ async function getApiData<T>(url: string): Promise<ApiResponse<T>> {
 }
 
 export default function App() {
-  const { width } = useWindowDimensions();
+  // Space taken by the phone's navigation buttons or gesture bar (3-button phones need more room).
+  // Read from Android once the screen is laid out, and again when the screen size changes.
+  const [bottomInset, setBottomInset] = useState(16);
+  useEffect(() => {
+    const read = () => setBottomInset(Math.max(8, navigationBarHeight() ?? 16));
+    const timer = setTimeout(read, 0);
+    const subscription = Dimensions.addEventListener('change', read);
+    return () => { clearTimeout(timer); subscription.remove(); };
+  }, []);
+  const { width, height } = useWindowDimensions();
+  // Small phones (about 4 to 5 inch screens) get a slightly more compact header.
+  const narrow = width < 360;
+  const scrollRef = useRef<ComponentRef<typeof ScrollView>>(null);
   // Atkinson Hyperlegible: a typeface designed for readability (low vision, early readers).
   const [fontsLoaded] = useFonts({ AtkinsonHyperlegible_400Regular, AtkinsonHyperlegible_700Bold, ...Ionicons.font });
   const [language, setLanguage] = useState<(typeof languages)[number]['code']>('en');
@@ -458,7 +473,8 @@ export default function App() {
     }
   };
 
-  const categories = useMemo(() => content.languages[language]?.categories ?? [], [content, language]);
+  const categories = useMemo(() => (content.languages[language]?.categories ?? [])
+    .map((category) => ({ ...category, name: categoryNameIn(category.name, language) })), [content, language]);
   const messages = useMemo(() => {
     const languageMessages = content.languages[language]?.messages ?? [];
     if (!selectedCategory || selectedCategory.startsWith(customCategoryPrefix)) return languageMessages;
@@ -487,7 +503,11 @@ export default function App() {
     const customCategorySelected = selectedCategory?.startsWith(customCategoryPrefix) ?? false;
     const availableMessages = customCategorySelected
       ? []
-      : messages.filter((message) => !hiddenMessageIds.includes(message.uuid));
+      : messages
+        .filter((message) => !hiddenMessageIds.includes(message.uuid))
+        .map((message) => (language === 'fil' && message.category
+          ? { ...message, category: { ...message.category, name: categoryNameIn(message.category.name, language) } }
+          : message));
     const localWordMessages: CommunicationMessage[] = customWords
       .filter((word) => wordTextIn(word, language) && (!selectedCategory || word.categoryId === selectedCategory))
       .map((word) => {
@@ -498,8 +518,8 @@ export default function App() {
         return {
           uuid: `custom:${word.id}`,
           slug: `custom-${word.id}`,
-          title: wordTextIn(word, language) ?? word.text,
-          message_text: wordTextIn(word, language) ?? word.text,
+          title: capitalizeFirst(wordTextIn(word, language) ?? word.text),
+          message_text: capitalizeFirst(wordTextIn(word, language) ?? word.text),
           icon: 'hello',
           is_emergency: false,
           is_featured: false,
@@ -895,8 +915,9 @@ export default function App() {
     ? customCategories.find((category) => category.id === selectedCategory)?.name ?? 'Custom category'
     : categories.find((category) => category.slug === selectedCategory)?.name ?? null;
 
-  const columnWidth: `${number}%` = width >= 900 ? '31.5%' : '48%';
-  const cardWidth = Math.round((width - 32) * (width >= 900 ? 0.315 : 0.48));
+  // One wide card per row on phones (hand signs fit in one neat row), two side by side on tablets.
+  const columnWidth: `${number}%` = width >= 700 ? '48%' : '100%';
+  const cardWidth = width >= 700 ? Math.round((width - 32 - 12) / 2) : width - 32;
   const categoryColor = (slug: string | undefined) => categories.find((category) => category.slug === slug)?.color ?? palette.sky;
   const accentFor = useStableCallback((message: CommunicationMessage) =>
     message.is_emergency ? palette.coral : categoryColor(message.category?.slug));
@@ -913,11 +934,11 @@ export default function App() {
   return (
     <View style={styles.screen}>
       <StatusBar style="dark" />
-      <ScrollView style={styles.scroll} contentContainerStyle={styles.page} keyboardShouldPersistTaps="handled">
+      <ScrollView ref={scrollRef} style={styles.scroll} contentContainerStyle={styles.page} keyboardShouldPersistTaps="handled">
         {/* Header: brand row, greeting, language */}
         <View style={styles.header}>
           <View style={styles.brandRow}>
-            <View style={styles.logoTile}>
+            <View style={[styles.logoTile, narrow && styles.logoTileNarrow]}>
               <Image
                 accessibilityLabel="Communication Bridge logo"
                 source={require('./assets/logo.png')}
@@ -926,7 +947,7 @@ export default function App() {
               />
             </View>
             <View style={styles.brandCopy}>
-              <Text style={styles.brandName}>Communication Bridge</Text>
+              <Text numberOfLines={2} style={[styles.brandName, narrow && styles.brandNameNarrow]}>Communication Bridge</Text>
               <View style={styles.statusLine}>
                 <View style={styles.statusDot} />
                 <Text style={styles.statusText}>Offline · Ready</Text>
@@ -942,7 +963,7 @@ export default function App() {
                     accessibilityLabel={item.label}
                     accessibilityState={{ selected: active }}
                     onPress={() => setLanguage(item.code)}
-                    style={[styles.languageOption, active && styles.languageOptionActive]}
+                    style={[styles.languageOption, narrow && styles.languageOptionNarrow, active && styles.languageOptionActive]}
                   >
                     <Text style={[styles.languageOptionText, active && styles.languageOptionTextActive]}>
                       {item.code === 'en' ? 'EN' : 'FIL'}
@@ -953,12 +974,15 @@ export default function App() {
             </View>
           </View>
 
-          <View style={styles.greeting}>
-            <Text style={styles.greetingEyebrow}>{greetingFor(greetingHour, language)}</Text>
-            <Text accessibilityRole="header" style={styles.greetingTitle}>
-              {language === 'fil' ? 'Ano ang gusto mong sabihin?' : 'What would you like to say?'}
-            </Text>
-          </View>
+          {/* The greeting only on the board, so the typing pad and Speak button fit on small phones. */}
+          {activeTab === 'board' ? (
+            <View style={styles.greeting}>
+              <Text style={styles.greetingEyebrow}>{greetingFor(greetingHour, language)}</Text>
+              <Text accessibilityRole="header" style={styles.greetingTitle}>
+                {language === 'fil' ? 'Ano ang gusto mong sabihin?' : 'What would you like to say?'}
+              </Text>
+            </View>
+          ) : null}
         </View>
 
         {activeTab === 'board' ? (
@@ -1037,7 +1061,14 @@ export default function App() {
               placeholderTextColor={palette.placeholder}
               value={speechDraft}
               onChangeText={setSpeechDraft}
-              style={styles.padInput}
+              // Autocorrect would change Bisaya and Filipino words (e.g. "sa" → "said").
+              autoCorrect={false}
+              spellCheck={false}
+              // The keyboard's Enter key speaks, so the Speak button is not needed while typing.
+              returnKeyType="send"
+              submitBehavior="blurAndSubmit"
+              onSubmitEditing={speakDraft}
+              style={[styles.padInput, height < 700 && styles.padInputCompact]}
             />
             <View style={styles.padToolbar}>
               {speechDraft.trim() ? (
@@ -1070,12 +1101,15 @@ export default function App() {
             accessibilityState={{ disabled: speechLoading || !speechDraft.trim() }}
             disabled={speechLoading || !speechDraft.trim()}
             onPress={speakDraft}
-            style={({ pressed }) => [styles.speakButton, (speechLoading || !speechDraft.trim()) && styles.speakButtonDisabled, pressed && styles.tilePressed]}
+            // While the voice gets ready the button stays blue and says so (grey looked broken).
+            style={({ pressed }) => [styles.speakButton, !speechLoading && !speechDraft.trim() && styles.speakButtonDisabled, pressed && styles.tilePressed]}
           >
             {speechLoading
               ? <ActivityIndicator color={palette.white} size="small" />
               : <Ionicons name="volume-high" size={22} color={speechDraft.trim() ? palette.white : palette.muted} />}
-            <Text style={[styles.speakButtonText, !speechDraft.trim() && styles.speakButtonTextDisabled]}>Speak</Text>
+            <Text style={[styles.speakButtonText, !speechLoading && !speechDraft.trim() && styles.speakButtonTextDisabled]}>
+              {speechLoading ? 'Getting ready…' : 'Speak'}
+            </Text>
           </Pressable>
           {speechError ? <Text accessibilityRole="alert" style={styles.errorText}>{speechError}</Text> : null}
 
@@ -1243,6 +1277,7 @@ export default function App() {
               onSubmitEditing={() => void saveCustomCategory()}
               returnKeyType="done"
               maxLength={40}
+              autoCorrect={false}
               style={styles.input}
             />
             <Pressable
@@ -1280,6 +1315,7 @@ export default function App() {
                 onSubmitEditing={addPendingWord}
                 returnKeyType="done"
                 maxLength={100}
+                autoCorrect={false}
                 style={styles.input}
               />
               <Pressable
@@ -1314,6 +1350,7 @@ export default function App() {
                           value={word.texts?.[item.code] ?? ''}
                           onChangeText={(value) => updatePendingTranslation(word.id, item.code, value)}
                           maxLength={100}
+                          autoCorrect={false}
                           style={styles.translationInput}
                         />
                       </View>
@@ -1375,7 +1412,7 @@ export default function App() {
         <View style={styles.sectionHeader}>
           <View>
             <Text accessibilityRole="header" style={styles.sectionTitle}>{selectedCategoryName ?? 'Communication board'}</Text>
-            <Text style={styles.sectionSubtitle}>{`${visibleMessages.length} phrases · tap a card to speak`}</Text>
+            <Text style={styles.sectionSubtitle}>{`${visibleMessages.length} ${visibleMessages.length === 1 ? 'phrase' : 'phrases'} · tap to speak · hold to remove`}</Text>
           </View>
         </View>
 
@@ -1414,7 +1451,7 @@ export default function App() {
 
       {/* Now speaking */}
       {lastSpoken ? (
-        <SlideUp visible={speakingVisible} style={styles.nowSpeaking}>
+        <SlideUp visible={speakingVisible} style={[styles.nowSpeaking, { bottom: 8 + 56 + 1 + 12 + bottomInset }]}>
           <View style={styles.nowSpeakingAccent} />
           <View style={styles.nowSpeakingIcon}>
             <Ionicons name="volume-high" size={20} color={palette.brand} />
@@ -1426,11 +1463,35 @@ export default function App() {
         </SlideUp>
       ) : null}
 
-      <TabBar active={activeTab} onChange={setActiveTab} />
+      <TabBar
+        active={activeTab}
+        onChange={(tab) => {
+          // Each tab starts at the top (the Speak screen used to open halfway down).
+          if (tab !== activeTab) scrollRef.current?.scrollTo({ y: 0, animated: false });
+          setActiveTab(tab);
+        }}
+        bottomInset={bottomInset}
+      />
 
       <Toast toast={toast} top={(RNStatusBar.currentHeight ?? 24) + 12} onHide={hideToast} />
     </View>
   );
+}
+
+// Filipino names for the built-in categories (the phrase data only has English names).
+const filipinoCategoryNames: Record<string, string> = {
+  'Daily Needs': 'Mga Pangangailangan',
+  'Classroom Communication': 'Sa Silid-aralan',
+  'Emotions and Feelings': 'Damdamin',
+  'Social Interaction': 'Pakikisalamuha',
+  'Emergency Communication': 'Pang-emergency',
+};
+function categoryNameIn(name: string, language: LanguageCode): string {
+  return language === 'fil' ? filipinoCategoryNames[name] ?? name : name;
+}
+
+function capitalizeFirst(text: string): string {
+  return text.charAt(0).toLocaleUpperCase() + text.slice(1);
 }
 
 // A friendly greeting for the time of day, in the board language.
@@ -1472,7 +1533,7 @@ const BoardList = memo(function BoardList({ messages, columnWidth, cardWidth, ac
 
   // Cards are placed in separate columns (each card goes to the shortest one), so every card is only
   // as tall as its own content: no stretched cards with empty space.
-  const columnCount = columnWidth === '48%' ? 2 : 3;
+  const columnCount = columnWidth === '48%' ? 2 : 1;
   const columns = useMemo(() => {
     const lists: { message: CommunicationMessage; index: number }[][] = Array.from({ length: columnCount }, () => []);
     const heights = new Array<number>(columnCount).fill(0);
@@ -1508,15 +1569,15 @@ const BoardList = memo(function BoardList({ messages, columnWidth, cardWidth, ac
 
 // A rough card height (in dp) from its text and hand signs, used only to keep the columns even.
 function estimateCardHeight(message: CommunicationMessage, cardWidth: number): number {
-  const inner = cardWidth - 2 * 14;
+  const inner = cardWidth - cardPaddingLeft - cardPaddingRight;
   const title = message.title ?? message.message_text ?? '';
   const titleLines = Math.max(1, Math.ceil((title.length * 11) / Math.max(40, inner - 50)));
   let height = 2 * 14 + titleLines * 24 + (message.is_emergency ? 18 : 0);
   if (message.title && message.message_text && message.message_text !== message.title) {
     height += 10 + Math.min(3, Math.ceil((message.message_text.length * 8.5) / inner)) * 22;
   }
-  const signWidth = inner - 2 * 8;
-  const size = signSizeFor(title, signWidth);
+  const signWidth = inner - 2 * signPanelPadding;
+  const size = signSizeFor(signWidth);
   const perLine = signLettersPerLine(signWidth, size);
   const signRows = title.split(/\s+/)
     .map((word) => [...word.replace(/[^a-zñ]/gi, '')])
@@ -1526,24 +1587,30 @@ function estimateCardHeight(message: CommunicationMessage, cardWidth: number): n
   return height + 10 + 36;
 }
 
+// Card title size: 20 px, smaller only when the longest word would not fit on one line
+// (so "Assistance" never breaks into "Assistanc / e", even with the phone's text set larger).
+function titleSizeFor(title: string, cardWidth: number): { fontSize: number; lineHeight: number } {
+  const longestWord = Math.max(1, ...title.split(/\s+/).map((word) => word.length));
+  const titleWidth = cardWidth - cardPaddingLeft - cardPaddingRight;
+  const fontSize = Math.max(14, Math.min(24, Math.floor(titleWidth / (longestWord * 0.64 * PixelRatio.getFontScale()))));
+  return { fontSize, lineHeight: Math.round(fontSize * 1.2) };
+}
+
 // How many hand signs of this size fit on one line of the card.
 function signLettersPerLine(availableWidth: number, size: number): number {
   return Math.max(1, Math.floor((availableWidth + 2) / (size + 2)));
 }
 
-// Hand-sign size so the longest word fits on one line of the card (words wrap only between words).
-function signSizeFor(text: string, availableWidth: number): number {
-  const longestWord = Math.max(1, ...text.split(/\s+/).map((word) => word.replace(/[^a-zñ]/gi, '').length));
-  // Big, clear hands: at most 3 letters per line, and longer words split into even lines
-  // (HEL/LO, HUN/GRY, QUE/ST/ION) so no letter sits alone on a line.
-  const lines = Math.ceil(longestWord / 3);
-  const lettersPerLine = Math.ceil(longestWord / lines);
-  return Math.max(30, Math.min(52, Math.floor(availableWidth / lettersPerLine) - 4));
-}
+// Card spacing (shared by the card layout and the size calculations below).
+const cardPaddingLeft = 22;
+const cardPaddingRight = 16;
+const signPanelPadding = 8;
 
-// A soft tint of a category colour (for the category tag).
-function tint(color: string): string {
-  return /^#[0-9a-f]{6}$/i.test(color) ? `${color}1F` : palette.canvas;
+// Hand-sign size: the same on every card, short word or long. On a phone 6 hands fit on a line,
+// so most words sit in one neat row; longer words continue on the next line, split evenly.
+function signSizeFor(availableWidth: number): number {
+  const perLine = availableWidth < 280 ? 5 : 6;
+  return Math.max(30, Math.min(48, Math.floor((availableWidth + 2) / perLine) - 2));
 }
 
 // One phrase card; only redraws when its own phrase changes. Tapping anywhere on it speaks.
@@ -1556,30 +1623,47 @@ const PhraseCard = memo(function PhraseCard({ message, index, columnWidth, cardW
   const accent = accentFor(message);
   const title = message.title ?? message.message_text ?? '';
   const spokenText = message.message_text ?? message.title ?? 'message';
-  const signWidth = cardWidth - 2 * 14 - 2 * 8;
-  const signSize = signSizeFor(title, signWidth);
+  const signWidth = cardWidth - cardPaddingLeft - cardPaddingRight - 2 * signPanelPadding;
+  const signSize = signSizeFor(signWidth);
+  const categoryName = message.category?.name ?? 'Message';
+  // Removing is a long press with a confirmation, so a quick tap can only ever speak.
+  const confirmRemove = () => {
+    Alert.alert(`Remove “${title}”?`, 'It will be hidden from the board on this phone.', [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Remove', style: 'destructive', onPress: () => onRemove(message) },
+    ]);
+  };
   return (
     <FadeIn delay={Math.min(index, 8) * 45} style={{ width: columnWidth }}>
       <Pressable
         accessibilityRole="button"
         accessibilityLabel={`Speak: ${spokenText}`}
+        accessibilityHint="Hold to remove this card"
+        accessibilityActions={[{ name: 'longpress', label: 'Remove this card' }]}
+        onAccessibilityAction={(event) => { if (event.nativeEvent.actionName === 'longpress') confirmRemove(); }}
         onPress={() => onSpeak(message)}
+        onLongPress={confirmRemove}
+        delayLongPress={500}
         style={({ pressed }) => [styles.phraseCard, message.is_emergency && styles.phraseCardEmergency, pressed && styles.cardPressed]}
       >
-        <View style={styles.phraseHead}>
-          <View style={styles.phraseHeadCopy}>
-            {message.is_emergency ? (
-              <View style={styles.emergencyTag}>
-                <Ionicons name="alert-circle" size={12} color={palette.coral} />
-                <Text style={styles.emergencyTagText}>EMERGENCY</Text>
-              </View>
-            ) : null}
-            <Text style={styles.phraseTitle}>{title}</Text>
+        {/* Category colour stripe */}
+        <View style={[styles.cardStripe, { backgroundColor: accent }]} />
+
+        <View style={styles.cardTop}>
+          <View style={styles.cardCategory}>
+            {message.is_emergency
+              ? <Ionicons name="alert-circle" size={14} color={palette.coral} />
+              : <View style={[styles.categoryDot, { backgroundColor: accent }]} />}
+            <Text numberOfLines={1} style={[styles.cardCategoryText, message.is_emergency && styles.cardCategoryEmergency]}>
+              {message.is_emergency ? 'EMERGENCY' : categoryName.toLocaleUpperCase()}
+            </Text>
           </View>
           <View accessibilityElementsHidden importantForAccessibility="no-hide-descendants" style={[styles.speakBadge, { backgroundColor: accent }]}>
-            <Ionicons name="volume-high" size={18} color={palette.white} />
+            <Ionicons name="volume-high" size={20} color={palette.white} />
           </View>
         </View>
+
+        <Text style={[styles.phraseTitle, titleSizeFor(title, cardWidth)]}>{title}</Text>
         {message.title && message.message_text !== message.title ? (
           <Text numberOfLines={3} style={styles.phraseText}>{message.message_text}</Text>
         ) : null}
@@ -1588,42 +1672,18 @@ const PhraseCard = memo(function PhraseCard({ message, index, columnWidth, cardW
         <View style={[styles.signPanel, message.is_emergency && styles.signPanelEmergency]}>
           <SignWord text={title} size={signSize} maxPerLine={signLettersPerLine(signWidth, signSize)} />
         </View>
-
-        <View style={styles.phraseFooter}>
-          <View style={[styles.categoryTag, { backgroundColor: message.is_emergency ? palette.coralSoft : tint(accent) }]}>
-            <View style={[styles.categoryDot, { backgroundColor: accent }]} />
-            <Text numberOfLines={1} style={styles.categoryTagText}>{message.category?.name ?? 'Message'}</Text>
-          </View>
-          <Pressable
-            accessibilityRole="button"
-            accessibilityLabel={`Remove ${spokenText} from this phone`}
-            hitSlop={6}
-            onPress={() => onRemove(message)}
-            style={({ pressed }) => [styles.removeButton, pressed && styles.pressed]}
-          >
-            <Ionicons name="trash-outline" size={17} color={palette.muted} />
-          </Pressable>
-        </View>
       </Pressable>
     </FadeIn>
   );
 });
 
-// Room for Android's navigation/gesture bar below the tab bar (no native safe-area module needed).
-function bottomSystemBarHeight(): number {
-  const screen = Dimensions.get('screen').height;
-  const window = Dimensions.get('window').height;
-  const statusBar = RNStatusBar.currentHeight ?? 0;
-  return Math.max(16, Math.min(48, Math.round(screen - window - statusBar)));
-}
-
-function TabBar({ active, onChange }: { active: 'board' | 'speak'; onChange: (tab: 'board' | 'speak') => void }) {
+function TabBar({ active, onChange, bottomInset }: { active: 'board' | 'speak'; onChange: (tab: 'board' | 'speak') => void; bottomInset: number }) {
   const tabs = [
     { key: 'board' as const, label: 'Board', icon: 'grid' as const, iconOutline: 'grid-outline' as const },
     { key: 'speak' as const, label: 'Speak', icon: 'chatbubble-ellipses' as const, iconOutline: 'chatbubble-ellipses-outline' as const },
   ];
   return (
-    <View accessibilityRole="tablist" style={[styles.tabBar, { paddingBottom: bottomSystemBarHeight() }]}>
+    <View accessibilityRole="tablist" style={[styles.tabBar, { paddingBottom: bottomInset }]}>
       {tabs.map((tab) => {
         const selected = active === tab.key;
         return (
@@ -1731,14 +1791,17 @@ const styles = StyleSheet.create({
 
   header: { paddingTop: (RNStatusBar.currentHeight ?? 24) + 12, paddingHorizontal: 20, gap: 22 },
   brandRow: { flexDirection: 'row', alignItems: 'center', gap: 12 },
+  logoTileNarrow: { width: 44, height: 44, borderRadius: 14 },
   logoTile: { width: 52, height: 52, borderRadius: 16, backgroundColor: palette.white, borderWidth: 1, borderColor: palette.line, alignItems: 'center', justifyContent: 'center' },
   brandLogo: { width: 44, height: 28 },
   brandCopy: { flex: 1, gap: 3 },
+  brandNameNarrow: { fontSize: 15 },
   brandName: { color: palette.ink, fontFamily: fonts.bold, fontSize: 16, letterSpacing: -0.2 },
   statusLine: { flexDirection: 'row', alignItems: 'center', gap: 6 },
   statusDot: { width: 7, height: 7, borderRadius: 4, backgroundColor: palette.green },
   statusText: { color: palette.muted, fontFamily: fonts.regular, fontSize: 13 },
   languageSwitch: { flexDirection: 'row', backgroundColor: palette.white, borderRadius: 14, borderWidth: 1, borderColor: palette.line, padding: 3 },
+  languageOptionNarrow: { minWidth: 40, paddingHorizontal: 6 },
   languageOption: { minWidth: 48, minHeight: 40, paddingHorizontal: 10, borderRadius: 11, alignItems: 'center', justifyContent: 'center' },
   languageOptionActive: { backgroundColor: palette.ink },
   languageOptionText: { color: palette.muted, fontFamily: fonts.bold, fontSize: 14, letterSpacing: 0.4 },
@@ -1788,6 +1851,7 @@ const styles = StyleSheet.create({
   speakButtonTextDisabled: { color: palette.muted },
   speakSection: { paddingHorizontal: 16, marginTop: 24, gap: 14 },
   pad: { backgroundColor: palette.surface, borderRadius: 24, borderWidth: 1, borderColor: palette.line, ...cardShadow },
+  padInputCompact: { minHeight: 120 },
   padInput: { minHeight: 210, paddingHorizontal: 20, paddingTop: 18, paddingBottom: 12, color: palette.ink, fontFamily: fonts.regular, fontSize: 24, lineHeight: 32, textAlignVertical: 'top' },
   padToolbar: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingHorizontal: 14, paddingVertical: 10, borderTopWidth: 1, borderTopColor: palette.line },
   padHint: { flex: 1, color: palette.muted, fontFamily: fonts.regular, fontSize: 13 },
@@ -1844,10 +1908,10 @@ const styles = StyleSheet.create({
 
   pendingList: { gap: 10 },
   pendingCard: { backgroundColor: palette.canvas, borderRadius: 18, padding: 12, gap: 10, borderWidth: 1, borderColor: palette.line },
-  translationRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
-  translationLabelButton: { width: 92, minHeight: 44, flexDirection: 'row', alignItems: 'center', gap: 4 },
+  translationRow: { gap: 4 },
+  translationLabelButton: { alignSelf: 'flex-start', minHeight: 36, flexDirection: 'row', alignItems: 'center', gap: 4 },
   translationLabel: { color: palette.brand, fontFamily: fonts.bold, fontSize: 14 },
-  translationInput: { flex: 1, minWidth: 0, minHeight: 44, backgroundColor: palette.surface, borderColor: palette.line, borderWidth: 1, borderRadius: 12, paddingHorizontal: 12, color: palette.ink, fontFamily: fonts.regular, fontSize: 16 },
+  translationInput: { minHeight: 44, backgroundColor: palette.surface, borderColor: palette.line, borderWidth: 1, borderRadius: 12, paddingHorizontal: 12, color: palette.ink, fontFamily: fonts.regular, fontSize: 16 },
   pendingActions: { flexDirection: 'row', justifyContent: 'flex-end', gap: 8 },
 
   notice: { flexDirection: 'row', alignItems: 'center', gap: 10, marginHorizontal: 16, marginBottom: 10, padding: 12, borderRadius: 16, backgroundColor: palette.surface, borderWidth: 1, borderColor: palette.line },
@@ -1861,23 +1925,20 @@ const styles = StyleSheet.create({
 
   board: { flexDirection: 'row', alignItems: 'flex-start', gap: 12, paddingHorizontal: 16 },
   boardColumn: { flex: 1, gap: 14 },
-  phraseCard: { backgroundColor: palette.surface, borderRadius: 24, padding: 14, gap: 10, borderWidth: 1, borderColor: palette.line, ...cardShadow },
+  phraseCard: { overflow: 'hidden', backgroundColor: palette.surface, borderRadius: 22, paddingTop: 14, paddingBottom: 16, paddingLeft: cardPaddingLeft, paddingRight: cardPaddingRight, gap: 6, borderWidth: 1, borderColor: palette.line, ...cardShadow },
   phraseCardEmergency: { backgroundColor: '#FFF7F5', borderColor: '#F5CDC8' },
-  cardPressed: { transform: [{ scale: 0.98 }], opacity: 0.92 },
-  phraseHead: { flexDirection: 'row', alignItems: 'flex-start', gap: 8 },
-  phraseHeadCopy: { flex: 1, gap: 4 },
-  speakBadge: { width: 36, height: 36, borderRadius: 18, alignItems: 'center', justifyContent: 'center' },
-  emergencyTag: { flexDirection: 'row', alignItems: 'center', gap: 4 },
-  emergencyTagText: { color: palette.coral, fontFamily: fonts.bold, fontSize: 11, letterSpacing: 1 },
-  phraseTitle: { color: palette.ink, fontFamily: fonts.bold, fontSize: 20, lineHeight: 24, letterSpacing: -0.3 },
-  phraseText: { color: palette.inkSoft, fontFamily: fonts.regular, fontSize: 15, lineHeight: 20 },
-  signPanel: { backgroundColor: palette.canvas, borderRadius: 16, paddingHorizontal: 8, paddingVertical: 10 },
+  cardPressed: { transform: [{ scale: 0.985 }], opacity: 0.94 },
+  cardStripe: { position: 'absolute', left: 0, top: 0, bottom: 0, width: 6 },
+  cardTop: { flexDirection: 'row', alignItems: 'center', gap: 10 },
+  cardCategory: { flex: 1, flexDirection: 'row', alignItems: 'center', gap: 6 },
+  cardCategoryText: { flexShrink: 1, color: palette.inkSoft, fontFamily: fonts.bold, fontSize: 12, letterSpacing: 0.8 },
+  cardCategoryEmergency: { color: palette.coral },
+  speakBadge: { width: 44, height: 44, borderRadius: 22, alignItems: 'center', justifyContent: 'center' },
+  phraseTitle: { color: palette.ink, fontFamily: fonts.bold, fontSize: 24, lineHeight: 29, letterSpacing: -0.4 },
+  phraseText: { color: palette.inkSoft, fontFamily: fonts.regular, fontSize: 16, lineHeight: 22 },
+  signPanel: { marginTop: 6, backgroundColor: palette.canvas, borderRadius: 16, paddingHorizontal: signPanelPadding, paddingVertical: 10 },
   signPanelEmergency: { backgroundColor: palette.coralSoft },
-  phraseFooter: { flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 'auto' },
-  categoryTag: { flexShrink: 1, flexDirection: 'row', alignItems: 'center', gap: 6, minWidth: 0, borderRadius: 999, paddingHorizontal: 10, paddingVertical: 6 },
   categoryDot: { width: 7, height: 7, borderRadius: 4 },
-  categoryTagText: { flexShrink: 1, color: palette.inkSoft, fontFamily: fonts.bold, fontSize: 12 },
-  removeButton: { marginLeft: 'auto', width: 38, height: 38, borderRadius: 19, alignItems: 'center', justifyContent: 'center' },
 
   tabBar: {
     flexDirection: 'row',
@@ -1897,7 +1958,7 @@ const styles = StyleSheet.create({
   footerLogo: { width: 72, height: 40, opacity: 0.9 },
   footerText: { color: palette.muted, fontFamily: fonts.regular, fontSize: 13, textAlign: 'center' },
 
-  nowSpeaking: { position: 'absolute', left: 16, right: 16, bottom: 8 + 56 + 1 + 12 + bottomSystemBarHeight(), flexDirection: 'row', alignItems: 'center', gap: 12, paddingVertical: 12, paddingLeft: 18, paddingRight: 16, overflow: 'hidden', borderRadius: 18, backgroundColor: palette.surface, borderWidth: 1, borderColor: palette.line, ...cardShadow, elevation: 8 },
+  nowSpeaking: { position: 'absolute', left: 16, right: 16, flexDirection: 'row', alignItems: 'center', gap: 12, paddingVertical: 12, paddingLeft: 18, paddingRight: 16, overflow: 'hidden', borderRadius: 18, backgroundColor: palette.surface, borderWidth: 1, borderColor: palette.line, ...cardShadow, elevation: 8 },
   nowSpeakingAccent: { position: 'absolute', left: 0, top: 0, bottom: 0, width: 5, backgroundColor: palette.brand },
   nowSpeakingIcon: { width: 42, height: 42, borderRadius: 14, backgroundColor: palette.brandSoft, alignItems: 'center', justifyContent: 'center' },
   nowSpeakingCopy: { flex: 1, gap: 1 },

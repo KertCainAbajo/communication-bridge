@@ -72,9 +72,9 @@ export const SignWord = memo(function SignWord({ text, size = 26, maxPerLine = 9
 });
 
 const styles = StyleSheet.create({
-  words: { width: '100%', flexDirection: 'row', flexWrap: 'wrap', columnGap: 10, rowGap: 6 },
+  words: { width: '100%', flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center', columnGap: 14, rowGap: 8 },
   // Long words continue on the next line (split evenly) instead of running past the card.
-  word: { maxWidth: '100%', gap: 4 },
+  word: { maxWidth: '100%', alignItems: 'center', gap: 4 },
   line: { flexDirection: 'row', gap: 2 },
   letter: { alignItems: 'center' },
   label: { color: '#475569', fontSize: 10, fontWeight: '800', marginTop: 1 },
