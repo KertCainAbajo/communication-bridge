@@ -16,14 +16,10 @@ import numpy as np
 import sherpa_onnx
 
 manifest_path, out_dir, models_dir = sys.argv[1:4]
-folders = {'fil': 'vits-mms-tgl', 'ceb': 'vits-mms-ceb', 'en': 'vits-piper-en-cori'}
-# Same as voiceSettings in builtInVoice.android.ts: noise_scale, noise_scale_w, length_scale,
-# pitch raise (made slower and played faster by this factor) and whether it is an MMS voice.
-settings = {
-    'fil': (0.35, 0.5, 1.1 * 1.45, 1.45, True),
-    'ceb': (0.35, 0.5, 1.1, 1.0, True),
-    'en': (0.667, 0.8, 1.05, 1.0, False),
-}
+# One English woman's voice (Piper "Cori") for every language; Filipino and Bisaya arrive respelled
+# for her (respellForEnglishVoice, done by make-board-recordings.mjs). Same settings as the app.
+folder_name = 'vits-piper-en-cori'
+noise, noise_w, length = 0.4, 0.5, 1.05
 ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
 os.makedirs(out_dir, exist_ok=True)
 
@@ -34,16 +30,14 @@ engines = {}
 
 
 def engine_for(voice):
-    if voice not in engines:
-        folder = os.path.join(models_dir, folders[voice])
-        noise, noise_w, length, _, _ = settings[voice]
-        data_dir = os.path.join(folder, 'espeak-ng-data')
-        engines[voice] = sherpa_onnx.OfflineTts(sherpa_onnx.OfflineTtsConfig(
+    if 'voice' not in engines:
+        folder = os.path.join(models_dir, folder_name)
+        engines['voice'] = sherpa_onnx.OfflineTts(sherpa_onnx.OfflineTtsConfig(
             model=sherpa_onnx.OfflineTtsModelConfig(
                 vits=sherpa_onnx.OfflineTtsVitsModelConfig(
                     model=os.path.join(folder, 'model.onnx'),
                     tokens=os.path.join(folder, 'tokens.txt'),
-                    data_dir=data_dir if os.path.isdir(data_dir) else '',
+                    data_dir=os.path.join(folder, 'espeak-ng-data'),
                     noise_scale=noise,
                     noise_scale_w=noise_w,
                     length_scale=length,
@@ -51,7 +45,12 @@ def engine_for(voice):
                 num_threads=4,
             ),
         ))
-    return engines[voice]
+    return engines['voice']
+
+
+def longest_seconds(text):
+    # Same as longestSeconds in builtInVoice.android.ts: longer means extra sounds that are not words.
+    return 0.5 + 0.12 * len(re.sub(r'[^\w]|[\d_]', '', text))
 
 
 def trim_to_words(samples, rate):
@@ -79,19 +78,21 @@ for entry in entries:
     target = os.path.join(out_dir, entry['file'])
     if os.path.exists(target):
         continue
-    _, _, _, pitch_raise, is_mms = settings[entry['voice']]
-    # MMS: a trailing ' - -' (pause) stops an extra sound after the last word (see textForVoice in the app).
-    # Piper (English) keeps the punctuation for natural speech.
     spoken = entry['prepared'].lower().strip()
-    if is_mms:
-        spoken = re.sub(r'[.,!?;:]+$', '', spoken) + ' - -'
-    audio = engine_for(entry['voice']).generate(spoken, sid=0, speed=1.0)
-    samples = trim_to_words(np.asarray(audio.samples, dtype=np.float32), audio.sample_rate)
+    # Made up to 6 times if it runs on with extra sounds; the shortest is kept (recordings are made
+    # once, so more tries than the app).
+    samples = None
+    for attempt in range(6):
+        audio = engine_for(entry['voice']).generate(spoken, sid=0, speed=1.0)
+        words = trim_to_words(np.asarray(audio.samples, dtype=np.float32), audio.sample_rate)
+        if samples is None or len(words) < len(samples):
+            samples = words
+        if len(samples) / audio.sample_rate <= longest_seconds(spoken):
+            break
     if samples.size == 0:
         raise SystemExit(f'No speech for {entry["key"]!r}')
     samples = samples / (np.max(np.abs(samples)) or 1.0) * 0.9
-    # Played faster than made for a raised voice.
-    rate = int(round(audio.sample_rate * pitch_raise))
+    rate = audio.sample_rate
     # A little silence first (some phones cut the very start of a sound) and after.
     samples = np.concatenate([np.zeros(int(rate * 0.05), np.float32), samples, np.zeros(int(rate * 0.2), np.float32)])
     with tempfile.TemporaryDirectory() as temporary:

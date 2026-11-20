@@ -1,15 +1,15 @@
-// Built-in offline voices for the Android app, all women's voices, run on the phone by sherpa-onnx:
-// - Filipino: Meta MMS Tagalog (CC BY-NC 4.0), made higher (see voiceSettings);
-// - Bisaya: Meta MMS Cebuano (CC BY-NC 4.0), a woman's voice already;
-// - English: Piper "Cori" (CC BY 4.0, Hi-Fi TTS dataset by NVIDIA).
-// They ship inside the APK (assets/models/*), so they need no internet or setup.
+// Built-in offline voice for the Android app: one English woman's voice, Piper "Cori" (CC BY 4.0,
+// Hi-Fi TTS dataset by NVIDIA), run on the phone by sherpa-onnx, for English, Filipino and Bisaya
+// alike (the client asked for the same English-accented woman's voice in all three). Filipino and
+// Bisaya are respelled for her syllable by syllable (respellForEnglishVoice in speechText.ts).
+// The voice ships inside the APK (assets/models/vits-piper-en-cori), so it needs no internet or setup.
 //
 // Speed: speech is made in short chunks. Each chunk is saved as a small recording, so anything said
-// before (and anything prepared ahead with prepareBuiltInVoice) plays at once. Only one voice is
-// loaded at a time, which keeps memory low on 1 GB phones.
+// before (and anything prepared ahead with prepareBuiltInVoice) plays at once. One voice file serves
+// all three languages, so only one is in memory, which keeps memory low on 1 GB phones.
 import Storage from 'expo-sqlite/kv-store';
 import { TurboModuleRegistry } from 'react-native';
-import { prepareForMms, type MmsVoice } from './speechText';
+import { prepareForMms, respellForEnglishVoice, type MmsVoice } from './speechText';
 
 export type BuiltInVoice = MmsVoice;
 
@@ -19,12 +19,9 @@ type TtsEngine = Awaited<ReturnType<TtsModule['createTTS']>>;
 
 // Renamed whenever the voice files change: phones keep their first copy of a folder, so a new name
 // makes them copy the new files (and resets the crash protection).
-const modelFolders: Record<BuiltInVoice, string> = {
-  fil: 'models/vits-mms-tgl',
-  ceb: 'models/vits-mms-ceb',
-  en: 'models/vits-piper-en-cori',
-};
-const voiceSetName = 'voices-v2';
+const voiceFolder = 'models/vits-piper-en-cori';
+const modelFolders: Record<BuiltInVoice, string> = { fil: voiceFolder, ceb: voiceFolder, en: voiceFolder };
+const voiceSetName = 'voices-v3';
 
 // Loaded voices, most recently used last. Two are kept (e.g. the board language and Bisaya typed on
 // the Speak screen), so switching between them does not reload; a third frees the oldest.
@@ -126,7 +123,8 @@ function trace(message: string): void {
 
 // The engine for a voice. Only one voice is kept in memory: switching language frees the other one.
 function getEngine(tts: TtsModule, voice: BuiltInVoice): Promise<TtsEngine> {
-  const existing = loaded.findIndex((item) => item.voice === voice);
+  // Languages that use the same voice file share one engine.
+  const existing = loaded.findIndex((item) => modelFolders[item.voice] === modelFolders[voice]);
   if (existing >= 0) {
     const [item] = loaded.splice(existing, 1);
     loaded.push(item);
@@ -142,7 +140,7 @@ function getEngine(tts: TtsModule, voice: BuiltInVoice): Promise<TtsEngine> {
       modelType: 'vits',
       // Up to 4 processor cores (almost every phone since 2016 has at least 4).
       numThreads: 4,
-      modelOptions: { vits: voiceSettings[voice].vits },
+      modelOptions: { vits: voiceSettings },
     });
     markStep(null);
     trace(`${voice} loaded`);
@@ -198,30 +196,21 @@ function splitIntoChunks(text: string): Chunk[] {
 }
 
 // Bump when the voices or chunk settings change, so old recordings are not reused.
-const recordingVersion = 'w4';
+const recordingVersion = 'w5';
 
-// Voice settings (keep the same as scripts/render-board-recordings.py).
-// MMS: steadier and slightly slower than its defaults (0.667 / 0.8 / 1.0); in a listening test (speech
-// recognition on every board phrase) fewer words were misheard.
-// pitchRaise: the Filipino voice is a man's; it is made slower by this factor and played back faster by
-// the same factor, which keeps the speed but raises the pitch to a woman's (as clear in the same test).
-type VoiceSetting = {
-  vits: { noiseScale: number; noiseScaleW: number; lengthScale: number };
-  pitchRaise: number;
-  // MMS reads letters, not punctuation; Piper (English) uses the punctuation for natural speech.
-  mms: boolean;
-};
-const voiceSettings: Record<BuiltInVoice, VoiceSetting> = {
-  fil: { vits: { noiseScale: 0.35, noiseScaleW: 0.5, lengthScale: 1.1 * 1.45 }, pitchRaise: 1.45, mms: true },
-  ceb: { vits: { noiseScale: 0.35, noiseScaleW: 0.5, lengthScale: 1.1 }, pitchRaise: 1, mms: true },
-  en: { vits: { noiseScale: 0.667, noiseScaleW: 0.8, lengthScale: 1.05 }, pitchRaise: 1, mms: false },
-};
+// Voice settings (keep the same as scripts/render-board-recordings.py): steadier than Piper's defaults
+// (0.667 / 0.8), which made short words like "Yes." sometimes run on with extra sounds.
+const voiceSettings = { noiseScale: 0.4, noiseScaleW: 0.5, lengthScale: 1.05 };
 
-// The text as given to the voice. For MMS a trailing " - -" (a pause) stops the voice adding a sound
-// after the last word: the Filipino voice uses the same code for its gaps as for the letter "a", so
-// "tubig" could end as "tubiga". Keep the same as scripts/render-board-recordings.py.
+// The text as the voice reads it: English as written (numbers as words); Filipino and Bisaya respelled.
 export function textForVoice(text: string, voice: BuiltInVoice): string {
-  return voiceSettings[voice].mms ? `${text.replace(/[.,!?;:]+$/, '')} - -` : text;
+  return voice === 'en' ? prepareForMms(text, 'en') : respellForEnglishVoice(text, voice);
+}
+
+// The longest a chunk should take to say. The voice now and then runs on with sounds that are not
+// words; a chunk longer than this is made again (keep the same as the recording script).
+function longestSeconds(text: string): number {
+  return 0.5 + 0.12 * text.replace(/[^\p{L}]/gu, '').length;
 }
 
 // Two independent 32-bit hashes, so different chunks never share a recording.
@@ -283,13 +272,21 @@ async function makeChunk(modules: { tts: TtsModule; fs: FsModule }, voice: Built
   const engine = await getEngine(modules.tts, voice);
   markStep('speak');
   try {
-    const audio = await engine.generateSpeech(textForVoice(chunk.text, voice));
-    // Played faster than made for a raised voice (see voiceSettings).
-    const rate = Math.round(audio.sampleRate * voiceSettings[voice].pitchRaise);
+    // Made again (up to 3 tries, the shortest kept) if it runs on with extra sounds.
+    let spoken: number[] = [];
+    let rate = 22050;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const audio = await engine.generateSpeech(chunk.text);
+      const words = trimToWords(audio.samples, audio.sampleRate);
+      if (attempt === 0 || words.length < spoken.length) {
+        spoken = words;
+        rate = audio.sampleRate;
+      }
+      if (spoken.length / rate <= longestSeconds(chunk.text)) break;
+    }
     // A little silence first (some phones cut the very start of a sound), the speech at a clear
     // volume, and the pause after. One loop into one list: this runs on the app's main JavaScript
     // thread, so it must be quick (taps wait for it).
-    const spoken = trimToWords(audio.samples, audio.sampleRate);
     let peak = 0;
     for (let index = 0; index < spoken.length; index += 1) peak = Math.max(peak, Math.abs(spoken[index]));
     const gain = peak > 0 ? 0.9 / peak : 1;
@@ -333,7 +330,7 @@ export function prepareBuiltInVoice(text: string, voice: BuiltInVoice, typing = 
   if (typing) prepareGeneration += 1;
   const preparation = typing ? prepareGeneration : null;
   const complete = !typing;
-  const words = prepareForMms(text, voice);
+  const words = textForVoice(text, voice);
   const ready = complete ? words : words.replace(/\S+$/, '').trim();
   // All chunks of the words typed so far; if more words follow, only the last chunk is remade.
   for (const chunk of splitIntoChunks(ready)) {
@@ -358,7 +355,7 @@ export async function speakWithBuiltInVoiceInParts(
   const modules = usable();
   if (!modules) return false;
   speakGeneration += 1;
-  const chunks = splitIntoChunks(prepareForMms(text, voice));
+  const chunks = splitIntoChunks(textForVoice(text, voice));
   if (chunks.length === 0) return false;
 
   // Recordings that already exist play straight away: no disk check, no waiting for other voice work,

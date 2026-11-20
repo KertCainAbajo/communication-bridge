@@ -123,6 +123,68 @@ export function prepareForMms(text: string, voice: MmsVoice): string {
     .trim();
 }
 
+// ---- Filipino and Bisaya read by the built-in English woman's voice ----
+// The English voice reads English spelling, so each Filipino or Bisaya syllable is respelled the way an
+// English reader says it: "gusto ko ng tubig" -> "goos-taw kaw nahng too-beeg". Vowels: a -> ah,
+// e -> eh, i -> ee, o -> aw (British "aw" is closest to the Filipino o), u -> oo; ay -> eye, aw -> ow.
+// English words inside the sentence (in englishLoanwords, or English-looking like "juice") stay as
+// they are, so she says them naturally.
+const respellVowels: Record<string, string> = { a: 'ah', e: 'eh', i: 'ee', o: 'aw', u: 'oo' };
+const respellDiphthongs: Record<string, string> = { ay: 'eye', ai: 'eye', aw: 'ow', ao: 'ow', oy: 'oy', iw: 'ew', uy: 'ooey' };
+const respellSpecial: Record<string, string> = { ng: 'nahng', mga: 'mah-ngah' };
+const englishLooking = /[cfqvxz]|th|sh|ph|wh|ck|ee|oo|ght|tion/;
+
+function respellWord(word: string): string {
+  const lower = word.toLowerCase();
+  if (respellSpecial[lower]) return respellSpecial[lower];
+  if (englishLoanwords[lower] !== undefined || englishLooking.test(lower)) return word;
+  const tokens = lower.match(/ng|ny|ts|[bdghjklmnprstwyñ]|[aeiou]/g) ?? [];
+  const syllables: string[] = [];
+  let onset = '';
+  let index = 0;
+  while (index < tokens.length) {
+    const token = tokens[index];
+    if (!respellVowels[token]) {
+      onset += token;
+      index += 1;
+      continue;
+    }
+    const next = tokens[index + 1] ?? '';
+    const afterNext = tokens[index + 2] ?? '';
+    let nucleus: string;
+    if (respellDiphthongs[token + next] && !respellVowels[afterNext]) {
+      nucleus = respellDiphthongs[token + next];
+      index += 2;
+    } else {
+      nucleus = respellVowels[token];
+      index += 1;
+    }
+    const consonants: string[] = [];
+    while (index < tokens.length && !respellVowels[tokens[index]]) {
+      consonants.push(tokens[index]);
+      index += 1;
+    }
+    // Before a vowel, the last consonant starts the next syllable.
+    const nextOnset = index < tokens.length && consonants.length ? consonants.pop() ?? '' : '';
+    syllables.push(onset + nucleus + consonants.join(''));
+    onset = nextOnset;
+  }
+  if (onset) {
+    if (syllables.length) syllables[syllables.length - 1] += onset;
+    else syllables.push(onset);
+  }
+  // Hard g before e/i ("gee" would be read "jee").
+  return syllables.map((syllable) => syllable.replace(/^g(?=ee|eh|eye)/, 'gh').replace(/ñ/g, 'ny')).join('-');
+}
+
+export function respellForEnglishVoice(text: string, voice: LocalVoice): string {
+  return text
+    .replace(/\d{1,3}(?:,\d{3})+|\d+/g, (match) => numberToWords(Number(match.replace(/,/g, '')), voice))
+    .replace(/[A-Za-zñÑ]+/g, respellWord)
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 // Filipino and Bisaya read by the phone's English voice (the built-in voice choice). Tested: the
 // English voice is understood best when it reads the normal spelling, so only short forms and
 // numbers are written out.

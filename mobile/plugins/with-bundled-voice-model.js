@@ -1,5 +1,5 @@
-// Expo config plugin: bundles the offline voices (Filipino and Bisaya: Meta MMS; English: Piper Cori)
-// inside the Android app.
+// Expo config plugin: bundles the offline voice (Piper "Cori", an English woman's voice used for
+// English, Filipino and Bisaya) inside the Android app.
 // Copies only the voices listed below from native-assets/models/ into
 // android/app/src/main/assets/models/ during `expo prebuild` (older voice folders there are left out),
 // and builds only for real-phone CPUs (32- and 64-bit ARM) to keep the APK smaller.
@@ -10,7 +10,8 @@ const fs = require('fs');
 const path = require('path');
 const { withDangerousMod, withGradleProperties } = require('expo/config-plugins');
 
-const voices = ['vits-mms-tgl', 'vits-mms-ceb', 'vits-piper-en-cori'];
+// One English woman's voice for English, Filipino and Bisaya (see builtInVoice.android.ts).
+const voices = ['vits-piper-en-cori'];
 
 function withBundledVoiceModel(config) {
   config = withDangerousMod(config, ['android', (modConfig) => {
