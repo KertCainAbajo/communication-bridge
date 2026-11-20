@@ -46,13 +46,13 @@ export function evenLines<T>(letters: T[], maxPerLine: number): T[][] {
 }
 
 // Memoised: the hand signs only redraw when the word changes.
-export const SignWord = memo(function SignWord({ text, size = 26, maxPerLine = 99 }: { text: string; size?: number; maxPerLine?: number }) {
+export const SignWord = memo(function SignWord({ text, size = 26, maxPerLine = 99, oneLine = false }: { text: string; size?: number; maxPerLine?: number; oneLine?: boolean }) {
   const words = fingerspell(text);
   if (words.length === 0) return null;
   const spelled = words.map((word) => word.map((letter) => letter.label).join(' ')).join(', ');
 
   return (
-    <View accessible accessibilityLabel={`Sign language fingerspelling: ${spelled}`} style={styles.words}>
+    <View accessible accessibilityLabel={`Sign language fingerspelling: ${spelled}`} style={oneLine ? styles.wordsOneLine : styles.words}>
       {words.map((word, wordIndex) => (
         <View key={wordIndex} style={styles.word}>
           {evenLines(word, maxPerLine).map((line, lineIndex) => (
@@ -75,6 +75,8 @@ const styles = StyleSheet.create({
   words: { width: '100%', flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center', columnGap: 14, rowGap: 8 },
   // Long words continue on the next line (split evenly) instead of running past the card.
   word: { maxWidth: '100%', alignItems: 'center', gap: 4 },
+  // All words in one row (scrolls sideways), used while typing.
+  wordsOneLine: { flexDirection: 'row', alignItems: 'flex-start', columnGap: 14 },
   line: { flexDirection: 'row', gap: 2 },
   letter: { alignItems: 'center' },
   label: { color: '#475569', fontSize: 10, fontWeight: '800', marginTop: 1 },

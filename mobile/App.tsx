@@ -4,13 +4,14 @@ import { AtkinsonHyperlegible_400Regular, AtkinsonHyperlegible_700Bold, useFonts
 import { useAudioPlayer, useAudioPlayerStatus } from 'expo-audio';
 import * as Speech from 'expo-speech';
 import Storage from 'expo-sqlite/kv-store';
-import { type ComponentRef, memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { type ComponentRef, memo, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
   Dimensions,
   PixelRatio,
   Image,
+  Keyboard,
   Platform,
   Pressable,
   ScrollView,
@@ -244,6 +245,11 @@ function normalizeVoiceLocale(locale: string): string {
   return locale.toLocaleLowerCase().replaceAll('_', '-');
 }
 
+// Google's voices that need internet have "network" in their name (e.g. fil-ph-x-fie-network).
+function isOnlineOnlyVoice(voice: Speech.Voice): boolean {
+  return /network/i.test(voice.identifier);
+}
+
 function findDeviceVoice(voices: Speech.Voice[], aliases: string[]): Speech.Voice | undefined {
   for (const alias of aliases) {
     const matches = voices.filter((voice) => {
@@ -297,6 +303,7 @@ export default function App() {
   // Small phones (about 4 to 5 inch screens) get a slightly more compact header.
   const narrow = width < 360;
   const scrollRef = useRef<ComponentRef<typeof ScrollView>>(null);
+  const chipScrollRef = useRef<ComponentRef<typeof ScrollView>>(null);
   // Atkinson Hyperlegible: a typeface designed for readability (low vision, early readers).
   const [fontsLoaded] = useFonts({ AtkinsonHyperlegible_400Regular, AtkinsonHyperlegible_700Bold, ...Ionicons.font });
   const [language, setLanguage] = useState<(typeof languages)[number]['code']>('en');
@@ -307,6 +314,20 @@ export default function App() {
   const [syncNotice, setSyncNotice] = useState<string | null>(null);
   const [lastSpoken, setLastSpoken] = useState('');
   const [speechDraft, setSpeechDraft] = useState('');
+  // Hand signs for the typed text: updated just after typing (so typing stays smooth on slow phones)
+  // and limited to the first letters (a hand image per letter is heavy for long texts).
+  const deferredDraft = useDeferredValue(speechDraft);
+  // While the keyboard is open only the word being typed is shown (it always fits above the keyboard);
+  // with the keyboard closed, the whole text.
+  const [keyboardOpen, setKeyboardOpen] = useState(false);
+  useEffect(() => {
+    const shown = Keyboard.addListener('keyboardDidShow', () => setKeyboardOpen(true));
+    const hidden = Keyboard.addListener('keyboardDidHide', () => setKeyboardOpen(false));
+    return () => { shown.remove(); hidden.remove(); };
+  }, []);
+  // Every typed word gets hand signs (up to maxTypedSignLetters letters).
+  const typedSigns = useMemo(() => firstLetters(deferredDraft, maxTypedSignLetters), [deferredDraft]);
+  const typedStripRef = useRef<ComponentRef<typeof ScrollView>>(null);
   const [speechError, setSpeechError] = useState<string | null>(null);
   // The phone's Google voice sounds natural like English; the built-in voice works on every phone.
   const [filipinoVoice, setFilipinoVoice] = useState<FilipinoVoiceChoice>('phone');
@@ -325,6 +346,24 @@ export default function App() {
   const [speechLoading, setSpeechLoading] = useState(false);
   const speechPlayer = useAudioPlayer(null, { downloadFirst: true });
   const speechPlayerStatus = useAudioPlayerStatus(speechPlayer);
+
+  // The phone's voices, read once. Reading them when the app opens also starts Android's voice
+  // engine, so the first tap speaks right away (speech sent before the engine is ready can be lost).
+  const phoneVoicesRef = useRef<Speech.Voice[] | null>(null);
+  // Every tap to speak gets the next number; only the newest tap may start speaking. With fast taps
+  // an older tap could otherwise reach the voice after a newer one, and Android then queued the
+  // newer card behind it (it seemed not to respond).
+  const speechRequestRef = useRef(0);
+  const loadPhoneVoices = async (): Promise<Speech.Voice[]> => {
+    const voices = await Speech.getAvailableVoicesAsync().catch(() => [] as Speech.Voice[]);
+    if (voices.length > 0) phoneVoicesRef.current = voices;
+    return voices;
+  };
+  useEffect(() => {
+    void Speech.getAvailableVoicesAsync()
+      .then((voices) => { if (voices.length > 0) phoneVoicesRef.current = voices; })
+      .catch(() => undefined);
+  }, []);
 
   // The "Speaking" bar shows while speech plays and hides 1 second after it ends
   // (or after 15 seconds at most, in case a voice never reports that it finished).
@@ -543,12 +582,22 @@ export default function App() {
 
   // Speaks with the first phone voice in the list. Phones often list voices that are not downloaded;
   // Android then reports an error, and the next voice in the list is used, so speech never stays silent.
-  const speakWithPhoneVoices = async (attempts: { text: string; aliases: string[] }[]): Promise<boolean> => {
-    const voices = await Speech.getAvailableVoicesAsync();
-    const options = attempts.flatMap((attempt) => {
-      const voice = findDeviceVoice(voices, attempt.aliases);
+  const speakWithPhoneVoices = async (
+    attempts: { text: string; aliases: string[] }[],
+    isNewest: () => boolean = () => true,
+  ): Promise<boolean> => {
+    // The voice list is read once (see loadPhoneVoices); asking Android for it on every tap
+    // added about a second before each card spoke.
+    const voices = phoneVoicesRef.current ?? await loadPhoneVoices();
+    // Voices downloaded on the phone come first, in the order asked. Online-only voices are tried
+    // last: without internet Android waits several seconds before giving up on them, which felt
+    // like the app not responding.
+    const installedVoices = voices.filter((voice) => !isOnlineOnlyVoice(voice));
+    const onlineVoices = voices.filter(isOnlineOnlyVoice);
+    const options = [installedVoices, onlineVoices].flatMap((pool) => attempts.flatMap((attempt) => {
+      const voice = findDeviceVoice(pool, attempt.aliases);
       return voice ? [{ text: attempt.text, voice }] : [];
-    });
+    }));
     if (options.length === 0) return false;
 
     const speakOption = (index: number) => {
@@ -558,9 +607,13 @@ export default function App() {
         voice: voice.identifier,
         rate: 0.88,
         pitch: 1.02,
-        onDone: speechFinished,
-        onStopped: speechFinished,
+        // Only the newest speech may hide the "Now speaking" bar (an older one stopped by a new tap
+        // used to hide it while the new card was still speaking).
+        onDone: () => { if (isNewest()) speechFinished(); },
+        onStopped: () => { if (isNewest()) speechFinished(); },
         onError: () => {
+          // A newer tap has taken over: don't fall back to another voice for this old one.
+          if (!isNewest()) return;
           if (index + 1 < options.length) speakOption(index + 1);
           else {
             setSpeechError('The phone voice could not speak this text.');
@@ -570,6 +623,8 @@ export default function App() {
       });
     };
     await Speech.stop();
+    // Another card was tapped meanwhile: let that one speak instead of queueing this one first.
+    if (!isNewest()) return true;
     speakOption(0);
     return true;
   };
@@ -584,9 +639,16 @@ export default function App() {
       ? 'ceb'
       : requestedVoice;
     const selectedLanguage = { label: voiceLabels[languageCode] };
-    setSpeechError(null);
-    setLastSpoken(text);
-    showSpeaking();
+    const requestId = speechRequestRef.current + 1;
+    speechRequestRef.current = requestId;
+    const isNewest = () => speechRequestRef.current === requestId;
+    // The "Now speaking" bar is shown after the voice has been started: redrawing the screen first
+    // made the voice start later.
+    const showNowSpeaking = () => {
+      setSpeechError(null);
+      setLastSpoken(text);
+      showSpeaking();
+    };
 
     // Natural recordings made with Google's voice (scripts/generate-natural-audio.mjs) come first.
     const speechKey = normalizeSpeechKey(text);
@@ -594,12 +656,13 @@ export default function App() {
       ?? (languageCode === 'ceb' ? offlineSpeech[`fil:${speechKey}`] : undefined);
     if (bundledAudio !== undefined) {
       await Speech.stop();
+      if (!isNewest()) return;
       speechPlayer.replace(bundledAudio);
       speechPlayer.play();
+      showNowSpeaking();
       return;
     }
 
-    setSpeechLoading(true);
     try {
       speechPlayer.pause();
       if (languageCode !== 'en' && Platform.OS === 'android') {
@@ -614,23 +677,34 @@ export default function App() {
           { text: spokenText, aliases: indonesianVoiceAliases },
           { text: spokenText, aliases: speechLanguageAliases.en },
         ];
-        if (await speakWithPhoneVoices(attempts)) return;
+        if (await speakWithPhoneVoices(attempts, isNewest)) {
+          if (isNewest()) showNowSpeaking();
+          return;
+        }
       }
       if (languageCode !== 'en') {
-        // Last resort, for phones with no English voice: the voice inside the app.
+        // Last resort, for phones with no English voice: the voice inside the app. It takes a few
+        // seconds to get ready, so the button shows "Getting ready…" meanwhile.
+        showNowSpeaking();
+        setSpeechLoading(true);
         const builtInAudio = await synthesizeWithBuiltInVoice(text, languageCode, { clearSpeech: true }).catch((error: unknown) => {
           console.log('[voice] error', String(error));
           return null;
         });
+        if (!isNewest()) return;
         if (builtInAudio) {
           console.log('[voice] playing', builtInAudio);
           await Speech.stop();
+          if (!isNewest()) return;
           speechPlayer.replace({ uri: builtInAudio });
           speechPlayer.play();
           return;
         }
       }
-      if (await speakWithPhoneVoices([{ text, aliases: speechLanguageAliases[languageCode] }])) return;
+      if (await speakWithPhoneVoices([{ text, aliases: speechLanguageAliases[languageCode] }], isNewest)) {
+        if (isNewest()) showNowSpeaking();
+        return;
+      }
 
       setSpeechError(Platform.OS === 'web'
         ? `This browser has no ${selectedLanguage.label} voice (computers usually lack one). Test ${selectedLanguage.label} speech on an Android phone.`
@@ -654,8 +728,9 @@ export default function App() {
   const speakDraft = () => {
     const phrase = speechDraft.trim();
     if (!phrase) return;
-    speakText(phrase, detectSpeechVoice(phrase, language));
-    setRecentlySaid((previous) => [phrase, ...previous.filter((item) => item !== phrase)].slice(0, 6));
+    // "Recently said" is updated after the voice has started, so drawing it never delays the voice.
+    void speakText(phrase, detectSpeechVoice(phrase, language)).then(() =>
+      setRecentlySaid((previous) => [phrase, ...previous.filter((item) => item !== phrase)].slice(0, 6)));
   };
 
   const addPendingWord = () => {
@@ -860,6 +935,8 @@ export default function App() {
       setCustomCategoryError(null);
       setShowCategoryInput(false);
       setSelectedCategory(category.id);
+      // Show the new category's chip (it is added at the end of the row, often off-screen).
+      setTimeout(() => chipScrollRef.current?.scrollToEnd({ animated: true }), 150);
       showToast('success', `Category “${name}” created`);
     } catch {
       setCustomCategoryError('Could not save this category on the device. Try again.');
@@ -914,6 +991,10 @@ export default function App() {
   const selectedCategoryName = selectedCategory?.startsWith(customCategoryPrefix)
     ? customCategories.find((category) => category.id === selectedCategory)?.name ?? 'Custom category'
     : categories.find((category) => category.slug === selectedCategory)?.name ?? null;
+
+  // Hand-sign size on the Speak screen (full width, same look as the cards).
+  const typedSignWidth = width - 32 - 2 * 10;
+  const typedSignSize = Math.max(28, Math.min(40, Math.floor((typedSignWidth + 2) / 8) - 2));
 
   // One wide card per row on phones (hand signs fit in one neat row), two side by side on tablets.
   const columnWidth: `${number}%` = width >= 700 ? '48%' : '100%';
@@ -1068,8 +1149,23 @@ export default function App() {
               returnKeyType="send"
               submitBehavior="blurAndSubmit"
               onSubmitEditing={speakDraft}
-              style={[styles.padInput, height < 700 && styles.padInputCompact]}
+              style={[styles.padInput, height < 700 && styles.padInputCompact, keyboardOpen && typedSigns.text ? styles.padInputWithSigns : null]}
             />
+            {/* While typing: hand signs for every word in one row right under the text, scrolled so
+                the newest letters are always visible above the keyboard. */}
+            {keyboardOpen && typedSigns.text ? (
+              <View style={styles.typedSignsPanel}>
+                <ScrollView
+                  ref={typedStripRef}
+                  horizontal
+                  showsHorizontalScrollIndicator={false}
+                  keyboardShouldPersistTaps="handled"
+                  onContentSizeChange={() => typedStripRef.current?.scrollToEnd({ animated: false })}
+                >
+                  <SignWord text={typedSigns.text} size={Math.min(typedSignSize, 30)} oneLine />
+                </ScrollView>
+              </View>
+            ) : null}
             <View style={styles.padToolbar}>
               {speechDraft.trim() ? (
                 <View style={styles.voicePill}>
@@ -1112,6 +1208,21 @@ export default function App() {
             </Text>
           </Pressable>
           {speechError ? <Text accessibilityRole="alert" style={styles.errorText}>{speechError}</Text> : null}
+
+          {/* Done typing: hand signs for every word, below the Speak button. */}
+          {!keyboardOpen && typedSigns.text ? (
+            <View style={styles.typedSignsFull}>
+              <View style={styles.quickHeader}>
+                <Text style={styles.sectionLabel}>HAND SIGNS</Text>
+                {typedSigns.shortened ? <Text style={styles.quickHint}>First {maxTypedSignLetters} letters</Text> : null}
+              </View>
+              <SignWord
+                text={typedSigns.text}
+                size={typedSignSize}
+                maxPerLine={signLettersPerLine(typedSignWidth, typedSignSize)}
+              />
+            </View>
+          ) : null}
 
           {/* Recently said */}
           {recentlySaid.length > 0 ? (
@@ -1236,7 +1347,7 @@ export default function App() {
             </Pressable>
           </View>
         </View>
-        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.chipRow}>
+        <ScrollView ref={chipScrollRef} horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.chipRow}>
           <CategoryChip
             label="All"
             count={categoryCounts.total}
@@ -1267,7 +1378,7 @@ export default function App() {
         </ScrollView>
 
         {showCategoryInput ? (
-          <View style={styles.inlineForm}>
+          <View style={[styles.inlineForm, styles.categoryForm]}>
             <TextInput
               accessibilityLabel="New category name"
               placeholder="Name your category"
@@ -1476,6 +1587,26 @@ export default function App() {
       <Toast toast={toast} top={(RNStatusBar.currentHeight ?? 24) + 12} onHide={hideToast} />
     </View>
   );
+}
+
+// The Speak screen shows hand signs for at most this many letters.
+const maxTypedSignLetters = 300;
+
+// The text cut to whole words holding at most `limit` letters (a long single word is cut).
+function firstLetters(text: string, limit: number): { text: string; shortened: boolean } {
+  const words = text.trim().split(/\s+/).filter((word) => /[a-zñ]/i.test(word));
+  const kept: string[] = [];
+  let count = 0;
+  for (const word of words) {
+    const letters = word.replace(/[^a-zñ]/gi, '').length;
+    if (count + letters > limit) {
+      if (kept.length === 0) kept.push(word.slice(0, limit));
+      return { text: kept.join(' '), shortened: true };
+    }
+    kept.push(word);
+    count += letters;
+  }
+  return { text: kept.join(' '), shortened: false };
 }
 
 // Filipino names for the built-in categories (the phrase data only has English names).
@@ -1858,6 +1989,9 @@ const styles = StyleSheet.create({
   clearButton: { flexDirection: 'row', alignItems: 'center', gap: 4, minHeight: 36, paddingHorizontal: 10, borderRadius: 18, backgroundColor: palette.canvas },
   clearButtonText: { color: palette.inkSoft, fontFamily: fonts.bold, fontSize: 13 },
   recentBlock: { gap: 8 },
+  typedSignsPanel: { marginHorizontal: 12, marginBottom: 10, backgroundColor: palette.canvas, borderRadius: 14, paddingHorizontal: 8, paddingVertical: 6 },
+  padInputWithSigns: { minHeight: 56 },
+  typedSignsFull: { gap: 8, backgroundColor: palette.surface, borderRadius: 20, borderWidth: 1, borderColor: palette.line, paddingHorizontal: 10, paddingVertical: 14 },
   recentList: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
   recentChip: { maxWidth: '100%', flexDirection: 'row', alignItems: 'center', gap: 6, minHeight: 44, paddingHorizontal: 14, borderRadius: 22, backgroundColor: palette.surface, borderWidth: 1, borderColor: palette.line },
   recentChipText: { flexShrink: 1, color: palette.ink, fontFamily: fonts.bold, fontSize: 15 },
@@ -1893,6 +2027,7 @@ const styles = StyleSheet.create({
   chipCountText: { color: palette.muted, fontFamily: fonts.bold, fontSize: 13 },
   chipCountTextSelected: { color: palette.white },
 
+  categoryForm: { paddingHorizontal: 16 },
   inlineForm: { flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: 10, marginTop: 12, paddingHorizontal: 0 },
   input: { flex: 1, minWidth: 0, minHeight: 50, backgroundColor: palette.canvas, borderColor: palette.line, borderWidth: 1, borderRadius: 14, paddingHorizontal: 14, color: palette.ink, fontFamily: fonts.regular, fontSize: 16 },
   primarySmall: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6, minHeight: 48, paddingHorizontal: 18, borderRadius: 14, backgroundColor: palette.brand },
