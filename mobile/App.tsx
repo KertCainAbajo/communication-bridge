@@ -43,8 +43,6 @@ const customCategoriesStorageKey = 'communication-bridge.custom-categories.v1';
 const hiddenMessagesStorageKey = 'communication-bridge.hidden-messages.v1';
 const offlineContentStorageKey = 'communication-bridge.offline-content.v1';
 // Which voice reads Filipino and Bisaya: the phone's own Google voice (natural) or the built-in one.
-const filipinoVoiceStorageKey = 'communication-bridge.filipino-voice.v1';
-type FilipinoVoiceChoice = 'phone' | 'builtin';
 const customCategoryPrefix = 'custom:';
 
 type ApiResponse<T> = {
@@ -128,6 +126,8 @@ const commonFilipinoWords = [
   'gutom', 'uhaw', 'pagod', 'masakit', 'tulong', 'tulungan', 'kain', 'kumain', 'inom', 'uminom', 'tubig', 'banyo', 'bahay',
   'masaya', 'malungkot', 'galit', 'takot', 'mahal', 'kita', 'tayo', 'nanay', 'tatay', 'kuya', 'ate', 'magandang', 'umaga',
   'hapon', 'gabi', 'paalam', 'ulit', 'sige', 'tara', 'ba', 'nga', 'yung', 'yan', 'dun', 'ganito', 'ganyan',
+  'nasaan', 'nasan', 'asan', 'ngayon', 'bukas', 'kahapon', 'ayoko', 'kong', 'lumabas', 'umuwi', 'uuwi', 'tiyan', 'ulo',
+  'mata', 'ilong', 'likod',
 ];
 
 const commonBisayaWords = [
@@ -142,7 +142,15 @@ const commonBisayaWords = [
   'mama', 'papa', 'lola', 'lolo', 'igsoon', 'manghod', 'magulang', 'amigo', 'higala', 'maestra', 'magtutudlo', 'tulog',
   'matulog', 'katulog', 'dula', 'magdula', 'adto', 'moadto', 'mouli', 'uli', 'gawas', 'mogawas', 'sulod', 'hulat',
   'paghulat', 'tan-aw', 'paminaw', 'storya', 'istorya', 'kabalo', 'kasabot', 'wa', 'di', 'nimo', 'kog', 'koy', 'kaayo',
+  // Words used in both languages (so they don't point to Filipino).
+  'tiyan', 'ulo', 'mata', 'kamot', 'tiil', 'ngipon', 'dalunggan', 'ilong', 'baba', 'likod', 'lawas',
 ];
+
+const strongBisayaWords = [
+  'imong', 'iyang', 'nako', 'nimo', 'naa', 'dili', 'unsa', 'asa', 'kaayo', 'gyud', 'jud', 'ug', 'og', 'ganahan',
+  'kinahanglan', 'palihug', 'tabangi', 'gigutom', 'giuhaw', 'kapoy', 'mouli', 'mokaon', 'moinom', 'karon', 'ugma', 'diri',
+];
+const strongBisayaSet = new Set(strongBisayaWords);
 
 const commonEnglishWords = [
   'i', 'me', 'my', 'you', 'your', 'he', 'she', 'we', 'they', 'it', 'is', 'am', 'are', 'was', 'were', 'be', 'the', 'a', 'an',
@@ -171,6 +179,8 @@ function buildLanguageVocabulary(content: OfflineContent) {
     english.delete(word); local.delete(word); filipino.delete(word); bisaya.delete(word);
   });
   [...filipino].filter((word) => bisaya.has(word)).forEach((word) => { filipino.delete(word); bisaya.delete(word); });
+  // Words only Bisaya speakers use always count as Bisaya, even if a Filipino board phrase contains them.
+  strongBisayaWords.forEach((word) => { filipino.delete(word); bisaya.add(word); });
   return { en: english, local, fil: filipino, ceb: bisaya };
 }
 
@@ -215,7 +225,8 @@ function detectSpeechVoice(text: string, fallback: LanguageCode): SpeechVoice {
   }
   if (!isLocal) return 'en';
 
-  const bisayaScore = count(languageVocabulary.ceb);
+  // Words only Bisaya speakers use count double; 'akong' (used in both) only breaks a tie.
+  const bisayaScore = count(languageVocabulary.ceb) + count(strongBisayaSet) + (words.includes('akong') ? 0.5 : 0);
   const filipinoScore = count(languageVocabulary.fil);
   return bisayaScore > filipinoScore ? 'ceb' : 'fil';
 }
@@ -371,20 +382,6 @@ export default function App() {
   // Every typed word gets hand signs (up to maxTypedSignLetters letters).
   const typedSigns = useMemo(() => firstLetters(deferredDraft, maxTypedSignLetters), [deferredDraft]);
   const [speechError, setSpeechError] = useState<string | null>(null);
-  // The phone's Google voice sounds natural like English; the built-in voice works on every phone.
-  const [filipinoVoice, setFilipinoVoice] = useState<FilipinoVoiceChoice>('phone');
-
-  useEffect(() => {
-    void readStoredValue(filipinoVoiceStorageKey).then((value) => {
-      if (value === 'builtin') setFilipinoVoice('builtin');
-    }).catch(() => undefined);
-  }, []);
-
-  const chooseFilipinoVoice = (choice: FilipinoVoiceChoice) => {
-    setFilipinoVoice(choice);
-    void writeStoredValue(filipinoVoiceStorageKey, choice).catch(() => undefined);
-  };
-
   const [speechLoading, setSpeechLoading] = useState(false);
   const speechPlayer = useAudioPlayer(null, { downloadFirst: true });
   const speechPlayerStatus = useAudioPlayerStatus(speechPlayer);
@@ -835,13 +832,13 @@ export default function App() {
       speechPlayer.pause();
       if (languageCode !== 'en' && Platform.OS === 'android') {
         // Filipino and Bisaya, best voice first:
-        // 1. the phone's Google Filipino voice (natural), if chosen;
+        // 1. the phone's Google Filipino voice (natural), if installed;
         // 2. Google's Indonesian voice, which reads Filipino spelling with nearly the right sounds
         //    (a e i o u, hard g, ng);
         // 3. the English voice, which every phone has.
         const spokenText = prepareForEnglishVoice(text, languageCode);
         const attempts = [
-          ...(filipinoVoice === 'phone' ? [{ text, aliases: speechLanguageAliases.fil }] : []),
+          { text, aliases: speechLanguageAliases.fil },
           { text: spokenText, aliases: indonesianVoiceAliases },
           { text: spokenText, aliases: speechLanguageAliases.en },
         ];
@@ -1434,35 +1431,6 @@ export default function App() {
                     <Text numberOfLines={1} style={styles.recentChipText}>{phrase}</Text>
                   </Pressable>
                 ))}
-              </View>
-            </View>
-          ) : null}
-
-          {/* Voice for Filipino and Bisaya */}
-          {Platform.OS === 'android' ? (
-            <View style={styles.voiceRow}>
-              <View style={styles.voiceRowCopy}>
-                <Text style={styles.voiceRowTitle}>{t.voiceRowTitle}</Text>
-                <Text style={styles.voiceRowHint}>
-                  {filipinoVoice === 'phone' ? t.voicePhoneHint : t.voiceBuiltInHint}
-                </Text>
-              </View>
-              <View style={styles.languageSwitch}>
-                {([['phone', t.voicePhone], ['builtin', t.voiceBuiltIn]] as const).map(([choice, label]) => {
-                  const active = filipinoVoice === choice;
-                  return (
-                    <Pressable
-                      key={choice}
-                      accessibilityRole="radio"
-                      accessibilityLabel={choice === 'phone' ? 'Filipino voice' : 'Clear voice'}
-                      accessibilityState={{ selected: active }}
-                      onPress={() => chooseFilipinoVoice(choice)}
-                      style={[styles.languageOption, active && styles.languageOptionActive]}
-                    >
-                      <Text style={[styles.languageOptionText, active && styles.languageOptionTextActive]}>{label}</Text>
-                    </Pressable>
-                  );
-                })}
               </View>
             </View>
           ) : null}
@@ -2249,11 +2217,6 @@ const styles = StyleSheet.create({
   recentList: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
   recentChip: { maxWidth: '100%', flexDirection: 'row', alignItems: 'center', gap: 6, minHeight: 44, paddingHorizontal: 14, borderRadius: 22, backgroundColor: palette.surface, borderWidth: 1, borderColor: palette.line },
   recentChipText: { flexShrink: 1, color: palette.ink, fontFamily: fonts.bold, fontSize: 15 },
-  voiceRow: { flexDirection: 'row', alignItems: 'center', gap: 12, padding: 14, borderRadius: 20, backgroundColor: palette.surface, borderWidth: 1, borderColor: palette.line },
-  voiceRowCopy: { flex: 1, gap: 2 },
-  voiceRowTitle: { color: palette.ink, fontFamily: fonts.bold, fontSize: 15 },
-  voiceRowHint: { color: palette.muted, fontFamily: fonts.regular, fontSize: 12 },
-  voiceChoice: { gap: 8 },
   segmented: { flexDirection: 'row', backgroundColor: palette.canvas, borderRadius: 16, padding: 4, gap: 4 },
   segment: { flex: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6, minHeight: 44, borderRadius: 12 },
   segmentActive: { backgroundColor: palette.brand },

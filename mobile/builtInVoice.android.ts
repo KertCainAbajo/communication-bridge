@@ -140,8 +140,9 @@ function getEngine(tts: TtsModule, voice: BuiltInVoice): Promise<TtsEngine> {
       modelType: 'vits',
       // Up to 4 processor cores (almost every phone since 2016 has at least 4).
       numThreads: 4,
-      // MMS's own settings, which give the clearest speech.
-      modelOptions: { vits: { noiseScale: 0.667, noiseScaleW: 0.8, lengthScale: 1 } },
+      // Steadier and slightly slower than MMS's defaults (0.667 / 0.8 / 1.0): in a listening test
+      // (speech recognition on every board phrase) fewer words were misheard.
+      modelOptions: { vits: { noiseScale: mmsNoiseScale, noiseScaleW: mmsNoiseScaleW, lengthScale: mmsLengthScale } },
     });
     markStep(null);
     trace(`${voice} loaded`);
@@ -197,7 +198,19 @@ function splitIntoChunks(text: string): Chunk[] {
 }
 
 // Bump when the voices or chunk settings change, so old recordings are not reused.
-const recordingVersion = 'mms2';
+const recordingVersion = 'mms3';
+
+// Voice settings (keep the same as scripts/render-board-recordings.py).
+const mmsNoiseScale = 0.35;
+const mmsNoiseScaleW = 0.5;
+const mmsLengthScale = 1.1;
+
+// The text as given to the voice. A trailing " - -" (a pause) stops the voice adding a sound after the
+// last word: the Filipino voice uses the same code for its gaps as for the letter "a", so "tubig"
+// could end as "tubiga". Keep the same as scripts/render-board-recordings.py.
+export function textForVoice(text: string): string {
+  return `${text.replace(/[.,!?;:]+$/, '')} - -`;
+}
 
 // Two independent 32-bit hashes, so different chunks never share a recording.
 function cacheKey(text: string, voice: string): string {
@@ -226,7 +239,7 @@ async function makeChunk(modules: { tts: TtsModule; fs: FsModule }, voice: Built
   const engine = await getEngine(modules.tts, voice);
   markStep('speak');
   try {
-    const audio = await engine.generateSpeech(chunk.text);
+    const audio = await engine.generateSpeech(textForVoice(chunk.text));
     const rate = audio.sampleRate;
     // A little silence first (some phones cut the very start of a sound), the speech at a clear
     // volume, and the pause after. One loop into one list: this runs on the app's main JavaScript

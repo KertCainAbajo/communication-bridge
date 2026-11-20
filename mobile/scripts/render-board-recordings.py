@@ -4,6 +4,7 @@
 # Usage: python render-board-recordings.py <manifest.json> <output dir> <voice models dir>
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -32,9 +33,10 @@ def engine_for(voice):
                 vits=sherpa_onnx.OfflineTtsVitsModelConfig(
                     model=os.path.join(folder, 'model.onnx'),
                     tokens=os.path.join(folder, 'tokens.txt'),
-                    noise_scale=0.667,
-                    noise_scale_w=0.8,
-                    length_scale=1.0,
+                    # Same settings as the app (builtInVoice.android.ts).
+                    noise_scale=0.35,
+                    noise_scale_w=0.5,
+                    length_scale=1.1,
                 ),
                 num_threads=4,
             ),
@@ -47,7 +49,9 @@ for entry in entries:
     target = os.path.join(out_dir, entry['file'])
     if os.path.exists(target):
         continue
-    audio = engine_for(entry['voice']).generate(entry['prepared'].lower(), sid=0, speed=1.0)
+    # A trailing ' - -' (pause) stops an extra sound after the last word (see textForVoice in the app).
+    spoken = re.sub(r'[.,!?;:]+$', '', entry['prepared'].lower().strip()) + ' - -'
+    audio = engine_for(entry['voice']).generate(spoken, sid=0, speed=1.0)
     samples = np.asarray(audio.samples, dtype=np.float32)
     if samples.size == 0:
         raise SystemExit(f'No speech for {entry["key"]!r}')

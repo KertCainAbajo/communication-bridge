@@ -43,3 +43,6 @@ yarn-error.*
 
 # Offline voice model (download with `node scripts/download-voice-model.mjs`)
 native-assets/models/
+
+# Python cache from the voice scripts
+__pycache__/
