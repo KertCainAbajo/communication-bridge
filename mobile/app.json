@@ -1,8 +1,8 @@
 {
   "expo": {
-    "name": "Communication Bridge",
+    "name": "Combri",
     "slug": "communication-bridge",
-    "version": "1.0.7",
+    "version": "1.0.8",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
@@ -18,7 +18,7 @@
       },
       "predictiveBackGestureEnabled": false,
       "package": "ph.communicationbridge.app",
-      "versionCode": 8
+      "versionCode": 9
     },
     "web": {
       "favicon": "./assets/favicon.png"

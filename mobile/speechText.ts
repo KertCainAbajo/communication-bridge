@@ -88,6 +88,41 @@ export function prepareForSpeech(text: string, voice: LocalVoice): string {
     .trim();
 }
 
+// ---- Meta MMS voices (the built-in voices) ----
+// MMS learned real Filipino and Bisaya spelling, so short forms like "mga" and "ng" stay as written.
+// The voices only know letters: numbers become words, and English words inside Filipino or Bisaya
+// are respelled the way Filipinos say them.
+export type MmsVoice = 'en' | 'fil' | 'ceb';
+
+const englishSmall = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten',
+  'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen', 'seventeen', 'eighteen', 'nineteen'];
+const englishTens = ['', '', 'twenty', 'thirty', 'forty', 'fifty', 'sixty', 'seventy', 'eighty', 'ninety'];
+
+function numberToEnglish(value: number): string {
+  if (!Number.isFinite(value) || value < 0 || value > 999999999) return String(value).split('').map((digit) => englishSmall[Number(digit)] ?? '').join(' ');
+  if (value < 20) return englishSmall[value];
+  if (value < 100) return `${englishTens[Math.floor(value / 10)]}${value % 10 ? ` ${englishSmall[value % 10]}` : ''}`;
+  if (value < 1000) return `${englishSmall[Math.floor(value / 100)]} hundred${value % 100 ? ` ${numberToEnglish(value % 100)}` : ''}`;
+  if (value < 1000000) return `${numberToEnglish(Math.floor(value / 1000))} thousand${value % 1000 ? ` ${numberToEnglish(value % 1000)}` : ''}`;
+  return `${numberToEnglish(Math.floor(value / 1000000))} million${value % 1000000 ? ` ${numberToEnglish(value % 1000000)}` : ''}`;
+}
+
+export function prepareForMms(text: string, voice: MmsVoice): string {
+  if (voice === 'en') {
+    return text
+      .replace(/\d{1,3}(?:,\d{3})+|\d+/g, (match) => numberToEnglish(Number(match.replace(/,/g, ''))))
+      .replace(/&/g, ' and ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+  return text
+    .replace(/\bthank\s+you\b/gi, 'tenkyu')
+    .replace(/\d{1,3}(?:,\d{3})+|\d+/g, (match) => numberToWords(Number(match.replace(/,/g, '')), voice))
+    .replace(/[A-Za-z']+/g, (word) => englishLoanwords[word.toLowerCase()] ?? word)
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 // Filipino and Bisaya read by the phone's English voice (the built-in voice choice). Tested: the
 // English voice is understood best when it reads the normal spelling, so only short forms and
 // numbers are written out.

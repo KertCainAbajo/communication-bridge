@@ -1,11 +1,15 @@
-// Built-in offline voice for the Android app, used for both Filipino and Bisaya so they sound the same:
-// the Piper Filipino voice (CC BY-NC-SA 4.0), run on the phone by sherpa-onnx. It ships inside the APK
-// (assets/models/vits-piper-fil-v2, prepared by scripts/prepare-voice-model.py), so it needs no internet or setup.
+// Built-in offline voices for the Android app: Meta MMS voices for Filipino (Tagalog), Bisaya (Cebuano)
+// and English (CC BY-NC 4.0), run on the phone by sherpa-onnx. They ship inside the APK
+// (assets/models/vits-mms-*, made by scripts/prepare-mms-voices.py), so they need no internet or setup.
+//
+// Speed: speech is made in short chunks. Each chunk is saved as a small recording, so anything said
+// before (and anything prepared ahead with prepareBuiltInVoice) plays at once. Only one voice is
+// loaded at a time, which keeps memory low on 1 GB phones.
 import Storage from 'expo-sqlite/kv-store';
 import { TurboModuleRegistry } from 'react-native';
-import { prepareForSpeech } from './speechText';
+import { prepareForMms, type MmsVoice } from './speechText';
 
-export type BuiltInVoice = 'fil' | 'ceb';
+export type BuiltInVoice = MmsVoice;
 
 type TtsModule = typeof import('react-native-sherpa-onnx/tts');
 type FsModule = typeof import('@dr.pogodin/react-native-fs');
@@ -13,11 +17,26 @@ type TtsEngine = Awaited<ReturnType<TtsModule['createTTS']>>;
 
 // Renamed whenever the voice files change: phones keep their first copy of a folder, so a new name
 // makes them copy the new files (and resets the crash protection).
-const modelFolder = 'models/vits-piper-fil-v2';
+const modelFolders: Record<BuiltInVoice, string> = {
+  fil: 'models/vits-mms-tgl',
+  ceb: 'models/vits-mms-ceb',
+  en: 'models/vits-mms-eng',
+};
+const voiceSetName = 'mms-v1';
 
-let enginePromise: Promise<TtsEngine> | null = null;
-// Requests run one at a time, so the voice handles one sentence at a time.
+// Loaded voices, most recently used last. Two are kept (e.g. the board language and Bisaya typed on
+// the Speak screen), so switching between them does not reload; a third frees the oldest.
+const maxLoadedVoices = 2;
+const loaded: { voice: BuiltInVoice; engine: Promise<TtsEngine> }[] = [];
+// Voice work runs one step at a time.
 let queue: Promise<unknown> = Promise.resolve();
+// Raised by every speak request; background preparation stops when it changes.
+let speakGeneration = 0;
+// Raised by every preparation request; only the newest one keeps going (older text is out of date).
+let prepareGeneration = 0;
+// Recordings known to exist, so speaking can start without waiting for the disk.
+const knownChunks = new Set<string>();
+let knownChunksRead: Promise<void> | null = null;
 
 // Expo Go has no sherpa-onnx native code; there the app falls back to the phone's voice.
 function loadNativeModules(): { tts: TtsModule; fs: FsModule } | null {
@@ -36,10 +55,10 @@ function loadNativeModules(): { tts: TtsModule; fs: FsModule } | null {
 }
 
 // Crash protection. A native crash closes the app with no message, so before each risky step
-// (loading the voice, speaking) a note is saved, and removed when the step finishes. If the app
+// (loading a voice, speaking) a note is saved, and removed when the step finishes. If the app
 // dies, the note is still there on the next start: the crash is counted, and a crash while
-// loading removes the possibly half-copied voice. After two crashes the built-in voice is switched
-// off and the phone's own voice is used, so the app never keeps crashing. New voice = fresh start.
+// loading removes the possibly half-copied voices. After two crashes the built-in voice is switched
+// off and the phone's own voice is used, so the app never keeps crashing. New voices = fresh start.
 type VoiceStep = 'load' | 'speak';
 type CrashState = { folder: string; crashes: number; inProgress: VoiceStep | null; lastCrash: VoiceStep | null };
 
@@ -48,10 +67,10 @@ const maxCrashes = 2;
 let crashStateChecked = false;
 
 function readCrashState(): CrashState {
-  const empty: CrashState = { folder: modelFolder, crashes: 0, inProgress: null, lastCrash: null };
+  const empty: CrashState = { folder: voiceSetName, crashes: 0, inProgress: null, lastCrash: null };
   try {
     const saved = JSON.parse(Storage.getItemSync(crashNoteKey) ?? 'null') as CrashState | null;
-    return saved?.folder === modelFolder ? saved : empty;
+    return saved?.folder === voiceSetName ? saved : empty;
   } catch {
     return empty;
   }
@@ -72,7 +91,9 @@ async function checkPreviousCrash(fs: FsModule): Promise<void> {
   const state = readCrashState();
   if (!state.inProgress) return;
   if (state.inProgress === 'load') {
-    await fs.unlink(`${fs.DocumentDirectoryPath}/${modelFolder}`).catch(() => undefined);
+    for (const folder of Object.values(modelFolders)) {
+      await fs.unlink(`${fs.DocumentDirectoryPath}/${folder}`).catch(() => undefined);
+    }
   }
   writeCrashState({ ...state, crashes: state.crashes + 1, lastCrash: state.inProgress, inProgress: null });
 }
@@ -91,117 +112,94 @@ export async function checkBuiltInVoiceHealth(): Promise<string | null> {
   const modules = loadNativeModules();
   if (!modules) return null;
   await checkPreviousCrash(modules.fs);
-  return builtInVoiceCrashNote();
-}
-
-function builtInVoiceCrashNote(): string | null {
   const { crashes, lastCrash } = readCrashState();
   if (crashes === 0 || !lastCrash) return null;
   return `Built-in voice crashed ${crashes}x while ${lastCrash === 'load' ? 'loading' : 'speaking'}`;
 }
 
-// Progress messages for finding crashes; they appear in the Expo terminal.
+// Progress messages for finding problems; they appear in the Expo terminal.
 function trace(message: string): void {
   console.log(`[voice] ${message}`);
 }
 
-function getEngine(tts: TtsModule): Promise<TtsEngine> {
-  enginePromise ??= (async () => {
+// The engine for a voice. Only one voice is kept in memory: switching language frees the other one.
+function getEngine(tts: TtsModule, voice: BuiltInVoice): Promise<TtsEngine> {
+  const existing = loaded.findIndex((item) => item.voice === voice);
+  if (existing >= 0) {
+    const [item] = loaded.splice(existing, 1);
+    loaded.push(item);
+    return item.engine;
+  }
+  const freed = loaded.length >= maxLoadedVoices ? loaded.shift() : undefined;
+  const engine = (async () => {
+    if (freed) await freed.engine.then((old) => old.destroy()).catch(() => undefined);
     markStep('load');
-    trace('loading voice');
-    const engine = await tts.createTTS({
-      modelPath: { type: 'asset', path: modelFolder },
+    trace(`loading ${voice}`);
+    const created = await tts.createTTS({
+      modelPath: { type: 'asset', path: modelFolders[voice] },
       modelType: 'vits',
-      // Up to 4 processor cores (almost every phone since 2016 has at least 4): words are made faster.
+      // Up to 4 processor cores (almost every phone since 2016 has at least 4).
       numThreads: 4,
-      // Steadier and slower than the voice's defaults (0.667 / 0.8 / 1.0), so words are easier to understand.
-      modelOptions: { vits: { noiseScale: 0.5, noiseScaleW: 0.6, lengthScale: speakingSlowness } },
+      // MMS's own settings, which give the clearest speech.
+      modelOptions: { vits: { noiseScale: 0.667, noiseScaleW: 0.8, lengthScale: 1 } },
     });
     markStep(null);
-    trace('voice loaded');
-    return engine;
+    trace(`${voice} loaded`);
+    return created;
   })();
-  enginePromise.catch(() => {
-    enginePromise = null;
+  loaded.push({ voice, engine });
+  engine.catch(() => {
+    const index = loaded.findIndex((item) => item.engine === engine);
+    if (index >= 0) loaded.splice(index, 1);
     markStep(null); // A normal error is not a crash.
   });
-  return enginePromise;
+  return engine;
 }
 
-// How slowly the voice speaks: 1 = the voice's normal speed, higher = slower.
-const speakingSlowness = 1.35;
-// Silence before the first word and after the last, so the phone's player never cuts them off.
-const leadingSilenceSeconds = 0.25;
-const trailingSilenceSeconds = 0.5;
-
-// Each sentence or clause is spoken separately with a clear pause after it. Every part ends with
-// punctuation: without it the voice stops mid-sound and the last word is cut off.
-function splitForPauses(text: string): { text: string; pauseSeconds: number }[] {
-  const parts = text.match(/[^.,!?;:]+[.,!?;:]*/g) ?? [text];
-  return parts
-    .map((part) => part.trim())
-    .filter((part) => /[a-zñ0-9]/i.test(part))
-    .map((part) => (/[.,!?;:]$/.test(part) ? part : `${part}.`))
-    .map((part) => ({ text: part, pauseSeconds: /[,;:]$/.test(part) ? 0.45 : 0.7 }));
+// Lists the recordings already on the phone (once), so they can be played without a disk check.
+function readKnownChunks(fs: FsModule): Promise<void> {
+  knownChunksRead ??= fs.readDir(fs.CachesDirectoryPath)
+    .then((items) => {
+      for (const item of items) {
+        if (item.name.includes(`-${recordingVersion}-`)) knownChunks.add(item.path);
+      }
+    })
+    .catch(() => undefined);
+  return knownChunksRead;
 }
 
-// Softens the last 30 ms of each part so it ends without a click.
-function fadeOut(samples: number[], sampleRate: number): number[] {
-  const fadeLength = Math.min(samples.length, Math.round(sampleRate * 0.03));
-  const faded = samples.slice();
-  for (let index = 0; index < fadeLength; index += 1) {
-    faded[faded.length - fadeLength + index] *= 1 - index / fadeLength;
+// ---- Chunks ----
+// Text is spoken in chunks: the first is short (heard quickly), later ones longer. A chunk ends at a
+// comma or full stop, or after a few words. Chunk boundaries depend only on the words before them,
+// so a sentence that grows while it is typed keeps the chunks it already had (and their recordings).
+type Chunk = { text: string; pauseSeconds: number };
+// Words per chunk: small at first (heard quickly; each next chunk is made while the one before plays).
+const chunkSizes = [3, 5, 8];
+
+function splitIntoChunks(text: string): Chunk[] {
+  // Lower case: the voices treat capitals the same, so "Go to school" and "go to school" share recordings.
+  const words = text.toLocaleLowerCase().split(/\s+/).filter((word) => /[\p{L}\p{N}]/u.test(word));
+  const chunks: Chunk[] = [];
+  let current: string[] = [];
+  const flush = (pauseSeconds: number) => {
+    if (current.length) chunks.push({ text: current.join(' '), pauseSeconds });
+    current = [];
+  };
+  for (const word of words) {
+    current.push(word);
+    const limit = chunkSizes[Math.min(chunks.length, chunkSizes.length - 1)];
+    if (/[.!?;:]$/.test(word)) flush(0.45);
+    else if (/,$/.test(word)) flush(0.3);
+    else if (current.length >= limit) flush(0.08);
   }
-  return faded;
+  flush(0.08);
+  return chunks;
 }
 
-function pushSilence(samples: number[], sampleRate: number, seconds: number): void {
-  for (let index = 0; index < Math.round(sampleRate * seconds); index += 1) samples.push(0);
-}
+// Bump when the voices or chunk settings change, so old recordings are not reused.
+const recordingVersion = 'mms2';
 
-// Clear speech: every word is spoken on its own with a short pause, so no word is swallowed or
-// run together (the voice tends to blur words inside longer sentences). Off = natural sentences.
-// Word by word, slowly: a calm pause between words, each word at the slow speaking speed.
-const pauseBetweenWordsSeconds = 0.28;
-const clearSpeechWordSpeed = 1;
-
-function splitIntoWords(parts: { text: string; pauseSeconds: number }[]): { text: string; pauseSeconds: number }[] {
-  return parts.flatMap((part) => {
-    const words = part.text.replace(/[.,!?;:]+$/, '').split(/\s+/).filter((word) => /[a-zñ0-9]/i.test(word));
-    return words.map((word, index) => ({
-      text: `${word}.`,
-      pauseSeconds: index === words.length - 1 ? part.pauseSeconds : pauseBetweenWordsSeconds,
-    }));
-  });
-}
-
-// A word spoken on its own comes with extra silence before and after it; trim that (keeping a
-// 25 ms margin) so clear speech keeps a natural pace.
-function trimSilence(samples: number[], sampleRate: number): number[] {
-  let peak = 0;
-  for (const sample of samples) peak = Math.max(peak, Math.abs(sample));
-  const threshold = peak * 0.04;
-  let start = 0;
-  let end = samples.length - 1;
-  while (start < end && Math.abs(samples[start]) < threshold) start += 1;
-  while (end > start && Math.abs(samples[end]) < threshold) end -= 1;
-  const margin = Math.round(sampleRate * 0.025);
-  return samples.slice(Math.max(0, start - margin), Math.min(samples.length, end + margin + 1));
-}
-
-// Brings every recording to the same clear volume (peak 90%) without changing how the voice sounds.
-function makeStrong(samples: number[]): number[] {
-  let peak = 0;
-  for (const sample of samples) peak = Math.max(peak, Math.abs(sample));
-  if (peak === 0) return samples;
-  const gain = 0.9 / peak;
-  return samples.map((sample) => sample * gain);
-}
-
-// Bump when the voice settings change, so old recordings are not reused.
-const recordingVersion = 'v11';
-
-// Two independent 32-bit hashes, so different sentences never share a cached recording.
+// Two independent 32-bit hashes, so different chunks never share a recording.
 function cacheKey(text: string, voice: string): string {
   let first = 0x811c9dc5;
   let second = 0;
@@ -213,130 +211,121 @@ function cacheKey(text: string, voice: string): string {
   return `${voice}-${recordingVersion}-${(first >>> 0).toString(36)}${(second >>> 0).toString(36)}-${text.length}`;
 }
 
-// Loads the voice in the background (a few seconds on cheap phones), so the first sentence spoken
-// with it does not wait for loading. Safe to call many times.
-export function preloadBuiltInVoice(): void {
+function chunkPath(fs: FsModule, voice: BuiltInVoice, chunk: Chunk): string {
+  return `${fs.CachesDirectoryPath}/${cacheKey(`${chunk.text}|${chunk.pauseSeconds}`, voice)}.wav`;
+}
+
+// Makes the recording of one chunk (if it is not saved yet) and returns its path.
+async function makeChunk(modules: { tts: TtsModule; fs: FsModule }, voice: BuiltInVoice, chunk: Chunk): Promise<string> {
+  const path = chunkPath(modules.fs, voice, chunk);
+  if (knownChunks.has(path)) return path;
+  if (await modules.fs.exists(path)) {
+    knownChunks.add(path);
+    return path;
+  }
+  const engine = await getEngine(modules.tts, voice);
+  markStep('speak');
+  try {
+    const audio = await engine.generateSpeech(chunk.text);
+    const rate = audio.sampleRate;
+    // A little silence first (some phones cut the very start of a sound), the speech at a clear
+    // volume, and the pause after. One loop into one list: this runs on the app's main JavaScript
+    // thread, so it must be quick (taps wait for it).
+    const spoken = audio.samples;
+    let peak = 0;
+    for (let index = 0; index < spoken.length; index += 1) peak = Math.max(peak, Math.abs(spoken[index]));
+    const gain = peak > 0 ? 0.9 / peak : 1;
+    const lead = Math.round(rate * 0.05);
+    const samples = new Array<number>(lead + spoken.length + Math.round(rate * chunk.pauseSeconds)).fill(0);
+    for (let index = 0; index < spoken.length; index += 1) samples[lead + index] = spoken[index] * gain;
+    await modules.tts.saveAudioToFile({ samples, sampleRate: rate }, path);
+    knownChunks.add(path);
+  } finally {
+    markStep(null); // Reached unless the app crashed.
+  }
+  return path;
+}
+
+function usable(): { tts: TtsModule; fs: FsModule } | null {
   const modules = loadNativeModules();
+  if (!modules || isBuiltInVoiceDisabled()) return null;
+  return modules;
+}
+
+// Loads a voice in the background (a few seconds on cheap phones), so speaking does not wait for it.
+export function preloadBuiltInVoice(voice: BuiltInVoice = 'fil'): void {
+  const modules = usable();
   if (!modules) return;
   queue = queue.catch(() => undefined).then(async () => {
     await checkPreviousCrash(modules.fs);
-    if (!isBuiltInVoiceDisabled()) await getEngine(modules.tts);
+    await readKnownChunks(modules.fs);
+    if (!isBuiltInVoiceDisabled()) await getEngine(modules.tts, voice);
   }).catch(() => undefined);
 }
 
-// Speaks part by part so the voice starts quickly: the first few words are made into a recording
-// and handed over (onPart) to play at once, and the rest is made while they play, a few words at a
-// time. Stops making parts as soon as isCancelled() says a newer text was asked for.
+// Prepares the recordings of a text in the background (while it is typed, or when a word is saved),
+// so speaking it later starts at once. Stops as soon as something is to be spoken.
+// `typing` true: the text is still being typed. The last word may be unfinished, so it is left out,
+// and only the newest text is prepared (older versions of it are out of date). A saved word (typing
+// false) is always prepared in full.
+export function prepareBuiltInVoice(text: string, voice: BuiltInVoice, typing = false): void {
+  const modules = usable();
+  if (!modules) return;
+  const generation = speakGeneration;
+  if (typing) prepareGeneration += 1;
+  const preparation = typing ? prepareGeneration : null;
+  const complete = !typing;
+  const words = prepareForMms(text, voice);
+  const ready = complete ? words : words.replace(/\S+$/, '').trim();
+  // All chunks of the words typed so far; if more words follow, only the last chunk is remade.
+  for (const chunk of splitIntoChunks(ready)) {
+    queue = queue.catch(() => undefined).then(async () => {
+      // Out of date: something is being spoken, or newer text is being prepared.
+      if (generation !== speakGeneration || (preparation !== null && preparation !== prepareGeneration)) return;
+      await checkPreviousCrash(modules.fs);
+      await readKnownChunks(modules.fs);
+      if (!isBuiltInVoiceDisabled()) await makeChunk(modules, voice, chunk);
+    }).catch(() => undefined);
+  }
+}
+
+// Speaks a text chunk by chunk: the first chunk plays as soon as it is ready (at once if it was made
+// before) while the rest is made. Stops when isCancelled() says a newer text was asked for.
 // Returns false if the built-in voice is not available.
-export function speakWithBuiltInVoiceInParts(
+export async function speakWithBuiltInVoiceInParts(
   text: string,
   voice: BuiltInVoice,
-  options: { clearSpeech?: boolean; isCancelled: () => boolean; onPart: (uri: string, isLast: boolean) => void },
+  options: { isCancelled: () => boolean; onPart: (uri: string, isLast: boolean) => void },
 ): Promise<boolean> {
-  const clearSpeech = options.clearSpeech ?? true;
-  const modules = loadNativeModules();
-  if (!modules) return Promise.resolve(false);
+  const modules = usable();
+  if (!modules) return false;
+  speakGeneration += 1;
+  const chunks = splitIntoChunks(prepareForMms(text, voice));
+  if (chunks.length === 0) return false;
+
+  // Recordings that already exist play straight away: no disk check, no waiting for other voice work,
+  // so the sound starts before the screen is redrawn.
+  let next = 0;
+  while (next < chunks.length) {
+    const path = chunkPath(modules.fs, voice, chunks[next]);
+    if (!knownChunks.has(path)) break;
+    if (options.isCancelled()) return true;
+    options.onPart(`file://${path}`, next === chunks.length - 1);
+    next += 1;
+  }
+  if (next === chunks.length) return true;
 
   const task = queue.catch(() => undefined).then(async () => {
-    if (options.isCancelled()) return true;
     await checkPreviousCrash(modules.fs);
-    if (isBuiltInVoiceDisabled()) return false;
-    const engine = await getEngine(modules.tts);
-    const sentences = splitForPauses(prepareForSpeech(text, voice));
-    const pieces = clearSpeech ? splitIntoWords(sentences) : sentences;
-    if (pieces.length === 0) return false;
-    // First part: 2 words (heard quickly); later parts: up to 6 words.
-    const groups: { text: string; pauseSeconds: number }[][] = [];
-    for (let index = 0; index < pieces.length;) {
-      const size = groups.length === 0 ? 2 : 6;
-      groups.push(pieces.slice(index, index + size));
-      index += size;
-    }
-    for (let groupIndex = 0; groupIndex < groups.length; groupIndex += 1) {
+    if (isBuiltInVoiceDisabled()) return next > 0;
+    for (let index = next; index < chunks.length; index += 1) {
       if (options.isCancelled()) return true;
-      const group = groups[groupIndex];
-      const isFirst = groupIndex === 0;
-      const isLast = groupIndex === groups.length - 1;
-      const key = cacheKey(`${group.map((piece) => piece.text).join(' ')}|${isFirst ? 'first' : ''}|${isLast ? 'last' : ''}`, `${voice}-${clearSpeech ? 'clear' : 'natural'}-part`);
-      const filePath = `${modules.fs.CachesDirectoryPath}/${key}.wav`;
-      if (!(await modules.fs.exists(filePath))) {
-        markStep('speak');
-        try {
-          const samples: number[] = [];
-          let sampleRate = engine.getSampleRate ? await engine.getSampleRate() : 22050;
-          if (isFirst) pushSilence(samples, sampleRate, leadingSilenceSeconds);
-          for (const piece of group) {
-            if (options.isCancelled()) return true;
-            const audio = await engine.generateSpeech(piece.text, clearSpeech ? { speed: clearSpeechWordSpeed } : undefined);
-            sampleRate = audio.sampleRate;
-            const spoken = clearSpeech ? trimSilence(audio.samples, sampleRate) : audio.samples;
-            for (const sample of fadeOut(spoken, sampleRate)) samples.push(sample);
-            pushSilence(samples, sampleRate, piece.pauseSeconds);
-          }
-          if (isLast) pushSilence(samples, sampleRate, trailingSilenceSeconds);
-          await modules.tts.saveAudioToFile({ samples: makeStrong(samples), sampleRate }, filePath);
-        } finally {
-          markStep(null); // Reached unless the app crashed.
-        }
-      }
+      const path = await makeChunk(modules, voice, chunks[index]);
       if (options.isCancelled()) return true;
-      options.onPart(`file://${filePath}`, isLast);
+      options.onPart(`file://${path}`, index === chunks.length - 1);
     }
     return true;
   });
   queue = task.catch(() => undefined);
-  return task;
-}
-
-// Returns a file:// URI of a WAV with the spoken text, or null if the built-in voice isn't available.
-// The voice is loaded on first use, not at app start, so the app always opens.
-export function synthesizeWithBuiltInVoice(
-  text: string,
-  voice: BuiltInVoice,
-  options: { clearSpeech?: boolean } = {},
-): Promise<string | null> {
-  const clearSpeech = options.clearSpeech ?? true;
-  const modules = loadNativeModules();
-  if (!modules) return Promise.resolve(null);
-
-  const task = queue.catch(() => undefined).then(async () => {
-    trace(`speak ${voice}: ${JSON.stringify(text)}`);
-    await checkPreviousCrash(modules.fs);
-    if (isBuiltInVoiceDisabled()) {
-      trace(`built-in voice switched off (${builtInVoiceCrashNote() ?? ''})`);
-      return null;
-    }
-    const filePath = `${modules.fs.CachesDirectoryPath}/${cacheKey(text, `${voice}-${clearSpeech ? 'clear' : 'natural'}`)}.wav`;
-    if (!(await modules.fs.exists(filePath))) {
-      const engine = await getEngine(modules.tts);
-      markStep('speak');
-      try {
-        const samples: number[] = [];
-        let sampleRate = engine.getSampleRate ? await engine.getSampleRate() : 22050;
-        pushSilence(samples, sampleRate, leadingSilenceSeconds);
-        const sentences = splitForPauses(prepareForSpeech(text, voice));
-        const parts = clearSpeech ? splitIntoWords(sentences) : sentences;
-        for (const part of parts) {
-          trace(`generating ${JSON.stringify(part.text)}`);
-          // Word by word: each word is generated on its own at the slow speaking speed.
-          const audio = await engine.generateSpeech(part.text, clearSpeech ? { speed: clearSpeechWordSpeed } : undefined);
-          trace(`generated ${audio.samples.length} samples at ${audio.sampleRate} Hz`);
-          sampleRate = audio.sampleRate;
-          const spoken = clearSpeech ? trimSilence(audio.samples, sampleRate) : audio.samples;
-          for (const sample of fadeOut(spoken, sampleRate)) samples.push(sample);
-          pushSilence(samples, sampleRate, part.pauseSeconds);
-        }
-        if (parts.length === 0) return null;
-        pushSilence(samples, sampleRate, trailingSilenceSeconds);
-        trace('saving recording');
-        await modules.tts.saveAudioToFile({ samples: makeStrong(samples), sampleRate }, filePath);
-        trace('saved');
-      } finally {
-        markStep(null); // Reached unless the app crashed.
-      }
-    }
-    return `file://${filePath}`;
-  });
-  queue = task;
   return task;
 }

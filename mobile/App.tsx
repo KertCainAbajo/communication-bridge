@@ -35,7 +35,7 @@ import { fastSpeech } from './modules/fast-speech';
 import { uiText, type UiText } from './uiText';
 import { FadeIn, Toast, type ToastMessage } from './motion';
 import { downloadTranslator, isTranslatorAvailable, isTranslatorReady, translateOffline } from './modules/offline-translator';
-import { checkBuiltInVoiceHealth, preloadBuiltInVoice, speakWithBuiltInVoiceInParts } from './builtInVoice';
+import { checkBuiltInVoiceHealth, prepareBuiltInVoice, preloadBuiltInVoice, speakWithBuiltInVoiceInParts } from './builtInVoice';
 
 const apiBaseUrl = (process.env.EXPO_PUBLIC_API_URL ?? 'http://localhost:8000/api').replace(/\/$/, '');
 const apiV1Url = `${apiBaseUrl}/v1`;
@@ -356,13 +356,34 @@ export default function App() {
   // Hand signs for the typed text: updated just after typing (so typing stays smooth on slow phones)
   // and limited to the first letters (a hand image per letter is heavy for long texts).
   const deferredDraft = useDeferredValue(speechDraft);
-  // While the keyboard is open only the word being typed is shown (it always fits above the keyboard);
-  // with the keyboard closed, the whole text.
+  // While typing, the finished words are made into speech in the background, so tapping Speak
+  // starts at once. Waits for a short pause in typing, so typing itself is never slowed down.
+  useEffect(() => {
+    const text = deferredDraft.trim();
+    if (!text) return;
+    const timer = setTimeout(() => {
+      const voice = detectSpeechVoice(text, language);
+      // Typing: the last word counts as finished once a space or punctuation follows it (the extra
+      // " ." stands in for the unfinished word that is left out).
+      prepareBuiltInVoice(/[\s.,!?]$/.test(deferredDraft) ? `${text} .` : text, voice, true);
+    }, 350);
+    return () => clearTimeout(timer);
+  }, [deferredDraft, language]);
+  // While the keyboard is open the hand signs show in one row above it; with the keyboard closed,
+  // the whole text. The switch waits a moment after the keyboard closes: pressing Enter to speak
+  // also closes it, and redrawing the hand signs then would compete with starting the voice.
   const [keyboardOpen, setKeyboardOpen] = useState(false);
   useEffect(() => {
-    const shown = Keyboard.addListener('keyboardDidShow', () => setKeyboardOpen(true));
-    const hidden = Keyboard.addListener('keyboardDidHide', () => setKeyboardOpen(false));
-    return () => { shown.remove(); hidden.remove(); };
+    let hideTimer: ReturnType<typeof setTimeout> | undefined;
+    const shown = Keyboard.addListener('keyboardDidShow', () => {
+      if (hideTimer) clearTimeout(hideTimer);
+      setKeyboardOpen(true);
+    });
+    const hidden = Keyboard.addListener('keyboardDidHide', () => {
+      if (hideTimer) clearTimeout(hideTimer);
+      hideTimer = setTimeout(() => setKeyboardOpen(false), 400);
+    });
+    return () => { shown.remove(); hidden.remove(); if (hideTimer) clearTimeout(hideTimer); };
   }, []);
   // Every typed word gets hand signs (up to maxTypedSignLetters letters).
   const typedSigns = useMemo(() => firstLetters(deferredDraft, maxTypedSignLetters), [deferredDraft]);
@@ -385,6 +406,13 @@ export default function App() {
   const [speechLoading, setSpeechLoading] = useState(false);
   const speechPlayer = useAudioPlayer(null, { downloadFirst: true });
   const speechPlayerStatus = useAudioPlayerStatus(speechPlayer);
+  // Warms up the sound player when the app opens (loads a recording without playing it), so the
+  // very first tap plays as fast as the later ones.
+  useEffect(() => {
+    const first = Object.values(offlineSpeech)[0];
+    if (first !== undefined) speechPlayer.replace(first);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // The phone's voices, read once. Reading them when the app opens also starts Android's voice
   // engine, so the first tap speaks right away (speech sent before the engine is ready can be lost).
@@ -401,14 +429,14 @@ export default function App() {
   useEffect(() => {
     void readPhoneVoices().then((voices) => {
       if (voices.length > 0) phoneVoicesRef.current = voices;
-      // Phones without a downloaded Filipino, Indonesian or English voice speak with the built-in
-      // voice: load it now (in the background), so the first sentence does not wait for loading.
-      const offlineVoices = voices.filter((voice) => voice.offline);
-      const hasPhoneVoice = [speechLanguageAliases.fil, indonesianVoiceAliases, speechLanguageAliases.en]
-        .some((aliases) => findDeviceVoice(offlineVoices, aliases));
-      if (!hasPhoneVoice) setTimeout(preloadBuiltInVoice, 2000);
     });
   }, []);
+  // The built-in voice of the board language is loaded in the background (a few seconds on cheap
+  // phones), so the first typed or added word does not wait for loading.
+  useEffect(() => {
+    const timer = setTimeout(() => preloadBuiltInVoice(language === 'fil' ? 'fil' : 'en'), 1500);
+    return () => clearTimeout(timer);
+  }, [language]);
   // "Done" and "error" reports from the app's speech module, passed to the text they belong to.
   const utteranceHandlersRef = useRef(new Map<string, { started: () => void; finished: () => void; failed: () => void }>());
   useEffect(() => {
@@ -764,10 +792,11 @@ export default function App() {
     const bundledAudio = offlineSpeech[`${languageCode}:${speechKey}`]
       ?? (languageCode === 'ceb' ? offlineSpeech[`fil:${speechKey}`] : undefined);
     if (bundledAudio !== undefined) {
-      await stopPhoneSpeech();
-      if (!isNewest()) return;
+      // Played at once; stopping the phone voice is not awaited, so nothing delays the sound.
+      clearBuiltInParts();
       speechPlayer.replace(bundledAudio);
       speechPlayer.play();
+      void stopPhoneSpeech().catch(() => undefined);
       showNowSpeaking();
       return;
     }
@@ -776,23 +805,29 @@ export default function App() {
     // Returns false if this phone cannot use it.
     const speakBuiltIn = async (): Promise<boolean> => {
       if (!isNewest()) return true;
-      showNowSpeaking();
-      setSpeechLoading(true);
       clearBuiltInParts();
       builtInMakingRef.current = true;
-      await stopPhoneSpeech();
+      // Not awaited: stopping the phone voice must not delay the first sound.
+      void stopPhoneSpeech().catch(() => undefined);
+      // "Getting ready…" only if nothing is heard within a moment (redrawing first would delay it).
+      let started = false;
+      const readyHint = setTimeout(() => { if (!started && isNewest()) setSpeechLoading(true); }, 400);
       try {
-        return await speakWithBuiltInVoiceInParts(text, languageCode === 'en' ? 'fil' : languageCode, {
-          clearSpeech: true,
+        return await speakWithBuiltInVoiceInParts(text, languageCode, {
           isCancelled: () => !isNewest(),
           onPart: (uri) => {
             if (!isNewest()) return;
-            setSpeechLoading(false);
             if (builtInPlayingRef.current) builtInPartsRef.current.push(uri);
             else playBuiltInPart(uri);
+            if (!started) {
+              started = true;
+              showNowSpeaking();
+              setSpeechLoading(false);
+            }
           },
         }).catch(() => false);
       } finally {
+        clearTimeout(readyHint);
         if (isNewest()) {
           builtInMakingRef.current = false;
           setSpeechLoading(false);
@@ -811,6 +846,10 @@ export default function App() {
     };
 
     try {
+      // The built-in MMS voices first, for every language: clear, the same on every phone, and
+      // instant for anything said or prepared before. The phone's own voice is only a last resort.
+      if (Platform.OS === 'android' && await speakBuiltIn()) return;
+      if (!isNewest()) return;
       speechPlayer.pause();
       if (languageCode !== 'en' && Platform.OS === 'android') {
         // Filipino and Bisaya, best voice first:
@@ -833,8 +872,6 @@ export default function App() {
         if (isNewest()) showNowSpeaking();
         return;
       }
-      // No usable phone voice: the voice inside the app.
-      if (Platform.OS === 'android' && await speakBuiltIn()) return;
       if (languageCode !== 'en' && await speakWithPhoneVoices([{ text, aliases: speechLanguageAliases[languageCode] }], isNewest)) {
         if (isNewest()) showNowSpeaking();
         return;
@@ -990,6 +1027,10 @@ export default function App() {
       const categoryName = customCategories.find((category) => category.id === word.categoryId)?.name
         ?? categories.find((category) => category.slug === word.categoryId)?.name;
       showToast('success', t.savedWord(wordTextIn(word, language) ?? word.text, categoryName ?? undefined));
+      // Make the word's recordings now (in the background), so tapping its card speaks at once.
+      prepareBuiltInVoice(englishText, 'en');
+      const filipinoVoice = detectSpeechVoice(filipinoText, 'fil');
+      prepareBuiltInVoice(filipinoText, filipinoVoice === 'en' ? 'fil' : filipinoVoice);
     } catch {
       setCustomWordError(t.couldNotSaveWord);
     }
@@ -1132,8 +1173,10 @@ export default function App() {
 
   // One wide card per row on phones (hand signs fit in one neat row), two side by side on tablets.
   // Cards in columns: two on phones, three on tablets.
-  const columnCount = width >= 700 ? 3 : 2;
-  const columnWidth: `${number}%` = columnCount === 3 ? '31%' : '48%';
+  // Two per row on phones, three on tablets; one per row when the phone's text is so large that two
+  // would be too narrow for the words (width counted in "text widths").
+  const columnCount = width >= 700 ? 3 : width / PixelRatio.getFontScale() >= 300 ? 2 : 1;
+  const columnWidth: `${number}%` = columnCount === 3 ? '31%' : columnCount === 2 ? '48%' : '100%';
   const cardWidth = Math.floor((width - 32 - 12 * (columnCount - 1)) / columnCount);
   const categoryColor = (slug: string | undefined) => categories.find((category) => category.slug === slug)?.color ?? palette.sky;
   const accentFor = useStableCallback((message: CommunicationMessage) =>
@@ -1142,7 +1185,8 @@ export default function App() {
   const [signCard, setSignCard] = useState<CommunicationMessage | null>(null);
   const speakMessage = useStableCallback((message: CommunicationMessage) => {
     speak(message);
-    setSignCard(message);
+    // The hand-sign panel opens just after the voice has started, so drawing it never delays the voice.
+    setTimeout(() => setSignCard(message), 120);
   });
   const signCardTitle = signCard ? signCard.title ?? signCard.message_text ?? '' : '';
   const signCardSentence = signCard && signCard.title && signCard.message_text !== signCard.title ? signCard.message_text : null;
@@ -1166,14 +1210,14 @@ export default function App() {
           <View style={styles.brandRow}>
             <View style={[styles.logoTile, narrow && styles.logoTileNarrow]}>
               <Image
-                accessibilityLabel="Communication Bridge logo"
+                accessibilityLabel="Combri logo"
                 source={require('./assets/logo.png')}
                 style={styles.brandLogo}
                 resizeMode="contain"
               />
             </View>
             <View style={styles.brandCopy}>
-              <Text numberOfLines={2} style={[styles.brandName, narrow && styles.brandNameNarrow]}>Communication Bridge</Text>
+              <Text numberOfLines={2} style={[styles.brandName, narrow && styles.brandNameNarrow]}>Combri</Text>
               <View style={styles.statusLine}>
                 <View style={styles.statusDot} />
                 <Text style={styles.statusText}>{t.offlineReady}</Text>
@@ -1880,7 +1924,7 @@ const BoardList = memo(function BoardList({ messages, columnWidth, cardWidth, te
 
 // Every card is a box of the same size: a bit taller than wide.
 function boxHeightFor(cardWidth: number): number {
-  return Math.round(cardWidth * 0.95);
+  return Math.min(Math.round(cardWidth * 0.95), 170);
 }
 
 // The biggest hand-sign size at which the whole word (or phrase) fits in the box's sign area,
@@ -1915,10 +1959,23 @@ function fitSignSize(title: string, width: number, height: number, largest = 44)
 // Card title size: 20 px, smaller only when the longest word would not fit on one line
 // (so "Assistance" never breaks into "Assistanc / e", even with the phone's text set larger).
 function titleSizeFor(title: string, cardWidth: number): { fontSize: number; lineHeight: number } {
-  const longestWord = Math.max(1, ...title.split(/\s+/).map((word) => word.length));
-  const titleWidth = cardWidth - cardPaddingLeft - cardPaddingRight;
-  const fontSize = Math.max(16, Math.min(cardWidth < 260 ? 24 : 28, Math.floor(titleWidth / (longestWord * 0.64 * PixelRatio.getFontScale()))));
-  return { fontSize, lineHeight: Math.round(fontSize * 1.2) };
+  return fitWordsSize(title, cardWidth, cardWidth < 260 ? 24 : 28, 0.7, 1.2);
+}
+
+// Sentence size: 15 px, smaller only when its longest word would not fit on one line.
+function sentenceSizeFor(sentence: string, cardWidth: number): { fontSize: number; lineHeight: number } {
+  return fitWordsSize(sentence, cardWidth, 15, 0.6, 1.33);
+}
+
+// The largest size (up to `largest`) at which the longest word fits the card's width. `letterWidth`
+// is a safe average letter width for the font (bold letters are wider), counted with the phone's
+// text size setting, which makes every letter bigger.
+function fitWordsSize(text: string, cardWidth: number, largest: number, letterWidth: number, lineHeight: number): { fontSize: number; lineHeight: number } {
+  const longestWord = Math.max(1, ...text.split(/\s+/).map((word) => word.length));
+  const width = cardWidth - cardPaddingLeft - cardPaddingRight;
+  const fits = Math.floor(width / (longestWord * letterWidth * PixelRatio.getFontScale()));
+  const fontSize = Math.max(11, Math.min(largest, fits));
+  return { fontSize, lineHeight: Math.round(fontSize * lineHeight) };
 }
 
 // How many hand signs of this size fit on one line of the card.
@@ -1985,13 +2042,13 @@ const PhraseCard = memo(function PhraseCard({ message, index, columnWidth, cardW
 
         <View style={styles.cardWords}>
           <Text style={[styles.phraseTitle, titleStyle]}>{title}</Text>
-          {sentence ? <Text numberOfLines={3} style={styles.phraseText}>{sentence}</Text> : null}
+          {sentence ? <Text numberOfLines={4} style={[styles.phraseText, sentenceSizeFor(sentence, cardWidth)]}>{sentence}</Text> : null}
         </View>
 
         {/* Hint: tapping shows the hand signs. */}
         <View style={styles.cardSignHint}>
           <Ionicons name="hand-left-outline" size={14} color={palette.muted} />
-          <Text numberOfLines={1} style={styles.cardSignHintText}>{t.handSigns}</Text>
+          <Text numberOfLines={1} style={styles.cardSignHintText}>{t.cardHandSigns}</Text>
         </View>
       </Pressable>
     </FadeIn>
@@ -2053,7 +2110,7 @@ function CategoryChip({ label, count, color, selected, onPress }: {
   );
 }
 
-// Design tokens. Brand colours come from the Communication Bridge logo; text colours meet 4.5:1 contrast.
+// Design tokens. Brand colours come from the Combri logo; text colours meet 4.5:1 contrast.
 const palette = {
   brand: '#2A4FBF',
   brandDeep: '#1B347F',
@@ -2116,8 +2173,8 @@ const styles = StyleSheet.create({
   logoTile: { width: 52, height: 52, borderRadius: 16, backgroundColor: palette.white, borderWidth: 1, borderColor: palette.line, alignItems: 'center', justifyContent: 'center' },
   brandLogo: { width: 44, height: 28 },
   brandCopy: { flex: 1, gap: 3 },
-  brandNameNarrow: { fontSize: 15 },
-  brandName: { color: palette.ink, fontFamily: fonts.bold, fontSize: 16, letterSpacing: -0.2 },
+  brandNameNarrow: { fontSize: 20 },
+  brandName: { color: palette.ink, fontFamily: fonts.bold, fontSize: 22, letterSpacing: -0.4 },
   statusLine: { flexDirection: 'row', alignItems: 'center', gap: 6 },
   statusDot: { width: 7, height: 7, borderRadius: 4, backgroundColor: palette.green },
   statusText: { color: palette.muted, fontFamily: fonts.regular, fontSize: 13 },
@@ -2263,7 +2320,7 @@ const styles = StyleSheet.create({
   phraseText: { color: palette.inkSoft, fontFamily: fonts.regular, fontSize: 15, lineHeight: 20 },
   cardWords: { flexGrow: 1, justifyContent: 'center', gap: 4, paddingVertical: 4 },
   cardSignHint: { flexDirection: 'row', alignItems: 'center', gap: 4 },
-  cardSignHintText: { color: palette.muted, fontFamily: fonts.bold, fontSize: 10, letterSpacing: 0.6 },
+  cardSignHintText: { flexShrink: 1, color: palette.muted, fontFamily: fonts.bold, fontSize: 10, letterSpacing: 0.4 },
   signPanel: { flex: 1, marginTop: 6, justifyContent: 'center', overflow: 'hidden', backgroundColor: palette.canvas, borderRadius: 14, paddingHorizontal: signPanelPadding, paddingVertical: 10 },
   signPanelEmergency: { backgroundColor: palette.coralSoft },
   categoryDot: { width: 7, height: 7, borderRadius: 4 },
