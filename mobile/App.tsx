@@ -383,6 +383,8 @@ export default function App() {
   const typedSigns = useMemo(() => firstLetters(deferredDraft, maxTypedSignLetters), [deferredDraft]);
   const [speechError, setSpeechError] = useState<string | null>(null);
   const [speechLoading, setSpeechLoading] = useState(false);
+  // True while something is being said (the Speak button then becomes a Stop button).
+  const [isSpeaking, setIsSpeaking] = useState(false);
   const speechPlayer = useAudioPlayer(null, { downloadFirst: true });
   const speechPlayerStatus = useAudioPlayerStatus(speechPlayer);
   // Warms up the sound player when the app opens (loads a recording without playing it), so the
@@ -448,8 +450,8 @@ export default function App() {
   const [recentlySaid, setRecentlySaid] = useState<string[]>([]);
   // Two screens: the communication board and the "Speak anything" typing screen.
   const [activeTab, setActiveTab] = useState<'board' | 'speak'>('board');
-  // Called when speech ends (kept as one place to react to that; nothing is shown on screen now).
-  const speechFinished = () => undefined;
+  // Called when speech ends.
+  const speechFinished = () => setIsSpeaking(false);
 
   // Parts of a sentence made by the built-in voice, played one after the other while the next
   // parts are being made (see speakBuiltIn in speakText).
@@ -764,6 +766,7 @@ export default function App() {
     // Clears an old error once the voice has started (after it, so redrawing never delays the voice).
     const showNowSpeaking = () => {
       setSpeechError(null);
+      setIsSpeaking(true);
     };
 
     // Natural recordings made with Google's voice (scripts/generate-natural-audio.mjs) come first.
@@ -866,6 +869,18 @@ export default function App() {
     } finally {
       setSpeechLoading(false);
     }
+  };
+
+  // Stops whatever is being said: a recording, the built-in voice (and the parts still being
+  // made) or the phone's voice.
+  const stopSpeaking = () => {
+    // A new request id makes every part, fallback and "done" report of the old speech be ignored.
+    speechRequestRef.current += 1;
+    clearBuiltInParts();
+    speechPlayer.pause();
+    void stopPhoneSpeech().catch(() => undefined);
+    setSpeechLoading(false);
+    setIsSpeaking(false);
   };
 
   const speak = (message: CommunicationMessage) => {
@@ -1367,22 +1382,32 @@ export default function App() {
             </View>
           </View>
 
-          <Pressable
-            accessibilityRole="button"
-            accessibilityLabel={`Speak typed text in ${draftLanguageLabel}`}
-            accessibilityState={{ disabled: speechLoading || !speechDraft.trim() }}
-            disabled={speechLoading || !speechDraft.trim()}
-            onPress={speakDraft}
-            // While the voice gets ready the button stays blue and says so (grey looked broken).
-            style={({ pressed }) => [styles.speakButton, !speechLoading && !speechDraft.trim() && styles.speakButtonDisabled, pressed && styles.tilePressed]}
-          >
-            {speechLoading
-              ? <ActivityIndicator color={palette.white} size="small" />
-              : <Ionicons name="volume-high" size={22} color={speechDraft.trim() ? palette.white : palette.muted} />}
-            <Text style={[styles.speakButtonText, !speechLoading && !speechDraft.trim() && styles.speakButtonTextDisabled]}>
-              {speechLoading ? t.gettingReady : t.speak}
-            </Text>
-          </Pressable>
+          {isSpeaking || speechLoading ? (
+            // While speaking (or getting ready) the same button stops the voice.
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel={t.stopSpeaking}
+              onPress={stopSpeaking}
+              style={({ pressed }) => [styles.speakButton, styles.stopButton, pressed && styles.tilePressed]}
+            >
+              {speechLoading
+                ? <ActivityIndicator color={palette.white} size="small" />
+                : <Ionicons name="stop" size={22} color={palette.white} />}
+              <Text style={styles.speakButtonText}>{speechLoading ? `${t.gettingReady}  ·  ${t.stop}` : t.stop}</Text>
+            </Pressable>
+          ) : (
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel={`Speak typed text in ${draftLanguageLabel}`}
+              accessibilityState={{ disabled: !speechDraft.trim() }}
+              disabled={!speechDraft.trim()}
+              onPress={speakDraft}
+              style={({ pressed }) => [styles.speakButton, !speechDraft.trim() && styles.speakButtonDisabled, pressed && styles.tilePressed]}
+            >
+              <Ionicons name="volume-high" size={22} color={speechDraft.trim() ? palette.white : palette.muted} />
+              <Text style={[styles.speakButtonText, !speechDraft.trim() && styles.speakButtonTextDisabled]}>{t.speak}</Text>
+            </Pressable>
+          )}
           {speechError ? <Text accessibilityRole="alert" style={styles.errorText}>{speechError}</Text> : null}
 
           {/* Hand signs of the typed text, on request (a long text made the screen very long). */}
@@ -2202,6 +2227,7 @@ const styles = StyleSheet.create({
   characterCount: { marginLeft: 'auto', color: palette.muted, fontFamily: fonts.regular, fontSize: 13 },
   speakButton: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 10, minHeight: 60, borderRadius: 20, backgroundColor: palette.brand, ...cardShadow },
   speakButtonDisabled: { backgroundColor: '#E4E0D8', shadowOpacity: 0, elevation: 0 },
+  stopButton: { backgroundColor: palette.coral },
   speakButtonText: { color: palette.white, fontFamily: fonts.bold, fontSize: 20 },
   speakButtonTextDisabled: { color: palette.muted },
   speakSection: { paddingHorizontal: 16, marginTop: 24, gap: 14 },
