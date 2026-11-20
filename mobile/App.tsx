@@ -1165,6 +1165,14 @@ export default function App() {
   // The hand-sign panel: a tapped card's word, or the text typed on the Speak screen.
   type SignSheet = { title: string | null; text: string | null; signs: string; shortened: boolean; color: string; speak: () => void };
   const [signSheet, setSignSheet] = useState<SignSheet | null>(null);
+  // True while more hand signs are hidden below in the panel (shows the "scroll down" hint).
+  const [signsMoreBelow, setSignsMoreBelow] = useState(false);
+  const signsScroll = useRef({ view: 0, content: 0, offset: 0 });
+  const updateSignsMoreBelow = () => {
+    const { view, content, offset } = signsScroll.current;
+    const more = view > 0 && content - view - offset > 12;
+    setSignsMoreBelow((current) => (current === more ? current : more));
+  };
   const speakMessage = useStableCallback((message: CommunicationMessage) => {
     speak(message);
     const title = message.title ?? message.message_text ?? '';
@@ -1772,16 +1780,35 @@ export default function App() {
                   <Ionicons name="close" size={24} color={palette.ink} />
                 </Pressable>
               </View>
-              {/* Long text scrolls inside the panel. */}
-              <ScrollView style={[styles.signSheetSigns, { maxHeight: Math.round(height * 0.5) }]} contentContainerStyle={styles.signSheetSignsContent}>
-                {signSheetSize > 0 ? (
-                  <SignWord
-                    text={signSheet.signs}
-                    size={signSheetSize}
-                    maxPerLine={signLettersPerLine(signSheetWidth, signSheetSize)}
-                  />
+              {/* Long text scrolls inside the panel; a hint at the bottom says so until the end is reached. */}
+              <View style={[styles.signSheetSignsWrap, { maxHeight: Math.round(height * 0.5) }]}>
+                <ScrollView
+                  key={signSheet.signs}
+                  style={styles.signSheetSigns}
+                  contentContainerStyle={styles.signSheetSignsContent}
+                  persistentScrollbar
+                  scrollEventThrottle={64}
+                  onLayout={({ nativeEvent }) => { signsScroll.current.view = nativeEvent.layout.height; updateSignsMoreBelow(); }}
+                  onContentSizeChange={(_, contentHeight) => { signsScroll.current.content = contentHeight; updateSignsMoreBelow(); }}
+                  onScroll={({ nativeEvent }) => { signsScroll.current.offset = nativeEvent.contentOffset.y; updateSignsMoreBelow(); }}
+                >
+                  {signSheetSize > 0 ? (
+                    <SignWord
+                      text={signSheet.signs}
+                      size={signSheetSize}
+                      maxPerLine={signLettersPerLine(signSheetWidth, signSheetSize)}
+                    />
+                  ) : null}
+                </ScrollView>
+                {signsMoreBelow ? (
+                  <View pointerEvents="none" style={styles.scrollHint}>
+                    <View style={styles.scrollHintPill}>
+                      <Ionicons name="chevron-down" size={16} color={palette.white} />
+                      <Text style={styles.scrollHintText}>{t.scrollForMore}</Text>
+                    </View>
+                  </View>
                 ) : null}
-              </ScrollView>
+              </View>
               <Pressable
                 accessibilityRole="button"
                 accessibilityLabel={t.speakAgain}
@@ -2332,7 +2359,11 @@ const styles = StyleSheet.create({
   signSheetTitle: { color: palette.ink, fontFamily: fonts.bold, fontSize: 28, lineHeight: 34, letterSpacing: -0.5 },
   signSheetSentence: { color: palette.inkSoft, fontFamily: fonts.regular, fontSize: 17, lineHeight: 23 },
   signSheetClose: { width: 44, height: 44, borderRadius: 22, alignItems: 'center', justifyContent: 'center', backgroundColor: palette.canvas },
-  signSheetSigns: { flexGrow: 0, borderRadius: 20, backgroundColor: palette.canvas },
+  signSheetSignsWrap: { overflow: 'hidden', borderRadius: 20, backgroundColor: palette.canvas },
+  signSheetSigns: { flexGrow: 0 },
+  scrollHint: { position: 'absolute', left: 0, right: 0, bottom: 0, alignItems: 'center', paddingTop: 18, paddingBottom: 10, backgroundColor: 'rgba(247, 245, 240, 0.85)' },
+  scrollHintPill: { flexDirection: 'row', alignItems: 'center', gap: 6, paddingHorizontal: 14, paddingVertical: 7, borderRadius: 999, backgroundColor: palette.ink },
+  scrollHintText: { color: palette.white, fontFamily: fonts.bold, fontSize: 13 },
   signSheetSignsContent: { alignItems: 'center', justifyContent: 'center', paddingVertical: 16, paddingHorizontal: 12 },
   signsButton: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, minHeight: 52, borderRadius: 18, borderWidth: 1.5, borderColor: palette.brand, backgroundColor: palette.brandSoft },
   signsButtonText: { color: palette.brand, fontFamily: fonts.bold, fontSize: 17 },
