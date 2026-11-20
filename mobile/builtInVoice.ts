@@ -17,3 +17,13 @@ export async function checkBuiltInVoiceHealth(): Promise<string | null> {
 export function isBuiltInVoiceDisabled(): boolean {
   return false;
 }
+
+export function preloadBuiltInVoice(): void {}
+
+export async function speakWithBuiltInVoiceInParts(
+  _text: string,
+  _voice: BuiltInVoice,
+  _options: { clearSpeech?: boolean; isCancelled: () => boolean; onPart: (uri: string, isLast: boolean) => void },
+): Promise<boolean> {
+  return false;
+}

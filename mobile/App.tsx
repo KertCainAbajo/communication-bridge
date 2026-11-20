@@ -7,7 +7,9 @@ import Storage from 'expo-sqlite/kv-store';
 import { type ComponentRef, memo, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  Modal,
   Alert,
+  AppState,
   Dimensions,
   PixelRatio,
   Image,
@@ -27,11 +29,13 @@ import bisayaPhraseWords from './assets/offline/bisaya-words.json';
 import { offlineSpeech } from './offlineSpeech';
 import { createTranslator } from './translation';
 import { normalizeSpeechKey, prepareForEnglishVoice } from './speechText';
-import { evenLines, SignWord } from './signLanguage';
+import { SignWord } from './signLanguage';
 import { navigationBarHeight } from './modules/system-insets';
-import { FadeIn, SlideUp, Toast, type ToastMessage } from './motion';
+import { fastSpeech } from './modules/fast-speech';
+import { uiText, type UiText } from './uiText';
+import { FadeIn, Toast, type ToastMessage } from './motion';
 import { downloadTranslator, isTranslatorAvailable, isTranslatorReady, translateOffline } from './modules/offline-translator';
-import { checkBuiltInVoiceHealth, synthesizeWithBuiltInVoice } from './builtInVoice';
+import { checkBuiltInVoiceHealth, preloadBuiltInVoice, speakWithBuiltInVoiceInParts } from './builtInVoice';
 
 const apiBaseUrl = (process.env.EXPO_PUBLIC_API_URL ?? 'http://localhost:8000/api').replace(/\/$/, '');
 const apiV1Url = `${apiBaseUrl}/v1`;
@@ -245,19 +249,52 @@ function normalizeVoiceLocale(locale: string): string {
   return locale.toLocaleLowerCase().replaceAll('_', '-');
 }
 
-// Google's voices that need internet have "network" in their name (e.g. fil-ph-x-fie-network).
-function isOnlineOnlyVoice(voice: Speech.Voice): boolean {
-  return /network/i.test(voice.identifier);
+// A voice on the phone. `offline` is true when it is downloaded (works without internet).
+type PhoneVoice = { identifier: string; language: string; offline: boolean };
+
+// Reads the phone's voices once. The app's own speech module (Android) reports which voices are
+// really downloaded; elsewhere voices with "network" in their name are taken to need internet.
+async function readPhoneVoices(): Promise<PhoneVoice[]> {
+  if (fastSpeech) {
+    const voices = await fastSpeech.getVoices().catch(() => []);
+    return voices.map((voice) => ({
+      identifier: voice.identifier,
+      language: voice.language,
+      offline: !voice.networkRequired && !voice.notInstalled,
+    }));
+  }
+  const voices = await Speech.getAvailableVoicesAsync().catch(() => [] as Speech.Voice[]);
+  return voices.map((voice) => ({ identifier: voice.identifier, language: voice.language, offline: !/network/i.test(voice.identifier) }));
 }
 
-function findDeviceVoice(voices: Speech.Voice[], aliases: string[]): Speech.Voice | undefined {
+// Stops the phone's voice (the app's own speech module on Android, expo-speech elsewhere).
+function stopPhoneSpeech(): Promise<void> {
+  return fastSpeech ? fastSpeech.stop() : Speech.stop();
+}
+
+// If the phone's voice has not started speaking after this long, the next voice is used (in the end
+// the built-in one), so a tap is never left silent.
+const phoneVoiceStartTimeoutMs = 1500;
+
+// Each spoken text gets its own id, to match the voice's "done" and "error" reports to it.
+let utteranceCount = 0;
+function nextUtteranceId(): string {
+  utteranceCount += 1;
+  return `utterance-${utteranceCount}`;
+}
+
+function isOnlineOnlyVoice(voice: PhoneVoice): boolean {
+  return !voice.offline;
+}
+
+function findDeviceVoice(voices: PhoneVoice[], aliases: string[]): PhoneVoice | undefined {
   for (const alias of aliases) {
     const matches = voices.filter((voice) => {
       const locale = normalizeVoiceLocale(voice.language);
       return locale === alias || locale.startsWith(`${alias}-`);
     });
     // Prefer voices that are installed on the phone (no internet needed).
-    const installed = matches.find((voice) => !/network/i.test(voice.identifier));
+    const installed = matches.find((voice) => voice.offline);
     if (installed ?? matches[0]) return installed ?? matches[0];
   }
   return undefined;
@@ -307,12 +344,14 @@ export default function App() {
   // Atkinson Hyperlegible: a typeface designed for readability (low vision, early readers).
   const [fontsLoaded] = useFonts({ AtkinsonHyperlegible_400Regular, AtkinsonHyperlegible_700Bold, ...Ionicons.font });
   const [language, setLanguage] = useState<(typeof languages)[number]['code']>('en');
+  // The app's own words in the chosen language (EN / FIL switch).
+  const t = uiText[language];
   const [content, setContent] = useState<OfflineContent>(initialContent);
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
   const [search, setSearch] = useState('');
   const [syncing, setSyncing] = useState(false);
   const [syncNotice, setSyncNotice] = useState<string | null>(null);
-  const [lastSpoken, setLastSpoken] = useState('');
+
   const [speechDraft, setSpeechDraft] = useState('');
   // Hand signs for the typed text: updated just after typing (so typing stays smooth on slow phones)
   // and limited to the first letters (a hand image per letter is heavy for long texts).
@@ -349,50 +388,91 @@ export default function App() {
 
   // The phone's voices, read once. Reading them when the app opens also starts Android's voice
   // engine, so the first tap speaks right away (speech sent before the engine is ready can be lost).
-  const phoneVoicesRef = useRef<Speech.Voice[] | null>(null);
+  const phoneVoicesRef = useRef<PhoneVoice[] | null>(null);
   // Every tap to speak gets the next number; only the newest tap may start speaking. With fast taps
   // an older tap could otherwise reach the voice after a newer one, and Android then queued the
   // newer card behind it (it seemed not to respond).
   const speechRequestRef = useRef(0);
-  const loadPhoneVoices = async (): Promise<Speech.Voice[]> => {
-    const voices = await Speech.getAvailableVoicesAsync().catch(() => [] as Speech.Voice[]);
+  const loadPhoneVoices = async (): Promise<PhoneVoice[]> => {
+    const voices = await readPhoneVoices();
     if (voices.length > 0) phoneVoicesRef.current = voices;
     return voices;
   };
   useEffect(() => {
-    void Speech.getAvailableVoicesAsync()
-      .then((voices) => { if (voices.length > 0) phoneVoicesRef.current = voices; })
-      .catch(() => undefined);
+    void readPhoneVoices().then((voices) => {
+      if (voices.length > 0) phoneVoicesRef.current = voices;
+      // Phones without a downloaded Filipino, Indonesian or English voice speak with the built-in
+      // voice: load it now (in the background), so the first sentence does not wait for loading.
+      const offlineVoices = voices.filter((voice) => voice.offline);
+      const hasPhoneVoice = [speechLanguageAliases.fil, indonesianVoiceAliases, speechLanguageAliases.en]
+        .some((aliases) => findDeviceVoice(offlineVoices, aliases));
+      if (!hasPhoneVoice) setTimeout(preloadBuiltInVoice, 2000);
+    });
+  }, []);
+  // "Done" and "error" reports from the app's speech module, passed to the text they belong to.
+  const utteranceHandlersRef = useRef(new Map<string, { started: () => void; finished: () => void; failed: () => void }>());
+  useEffect(() => {
+    if (!fastSpeech) return;
+    const handlers = utteranceHandlersRef.current;
+    const finish = ({ id }: { id: string }) => { handlers.get(id)?.finished(); handlers.delete(id); };
+    const fail = ({ id }: { id: string }) => { const handler = handlers.get(id); handlers.delete(id); handler?.failed(); };
+    const start = ({ id }: { id: string }) => handlers.get(id)?.started();
+    const subscriptions = [
+      fastSpeech.addListener('onStart', start),
+      fastSpeech.addListener('onDone', finish),
+      fastSpeech.addListener('onStop', finish),
+      fastSpeech.addListener('onError', fail),
+    ];
+    return () => subscriptions.forEach((subscription) => subscription.remove());
+  }, []);
+  // Coming back to the app: reconnect the phone's voice if Android closed it in the background,
+  // before the next tap (otherwise that tap waits about a second for the reconnection).
+  useEffect(() => {
+    if (!fastSpeech) return;
+    const subscription = AppState.addEventListener('change', (state) => {
+      if (state === 'active') void fastSpeech?.ensureReady().catch(() => undefined);
+    });
+    return () => subscription.remove();
   }, []);
 
-  // The "Speaking" bar shows while speech plays and hides 1 second after it ends
-  // (or after 15 seconds at most, in case a voice never reports that it finished).
-  const [speakingVisible, setSpeakingVisible] = useState(false);
   // Hour of the day for the greeting (read once when the app opens).
   const [greetingHour] = useState(() => new Date().getHours());
   // The last sentences spoken from the Speak screen, to say again with one tap.
   const [recentlySaid, setRecentlySaid] = useState<string[]>([]);
   // Two screens: the communication board and the "Speak anything" typing screen.
   const [activeTab, setActiveTab] = useState<'board' | 'speak'>('board');
-  const speakingTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const hideSpeakingAfter = (milliseconds: number) => {
-    if (speakingTimer.current) clearTimeout(speakingTimer.current);
-    speakingTimer.current = setTimeout(() => setSpeakingVisible(false), milliseconds);
+  // Called when speech ends (kept as one place to react to that; nothing is shown on screen now).
+  const speechFinished = () => undefined;
+
+  // Parts of a sentence made by the built-in voice, played one after the other while the next
+  // parts are being made (see speakBuiltIn in speakText).
+  const builtInPartsRef = useRef<string[]>([]);
+  const builtInPlayingRef = useRef(false);
+  const builtInMakingRef = useRef(false);
+  const playBuiltInPart = (uri: string) => {
+    builtInPlayingRef.current = true;
+    speechPlayer.replace({ uri });
+    speechPlayer.play();
   };
-  const showSpeaking = () => {
-    setSpeakingVisible(true);
-    hideSpeakingAfter(15000);
+  const clearBuiltInParts = () => {
+    builtInPartsRef.current = [];
+    builtInPlayingRef.current = false;
+    builtInMakingRef.current = false;
   };
-  const speechFinished = () => hideSpeakingAfter(300);
 
   useEffect(() => {
-    if (speechPlayerStatus.didJustFinish) speechFinished();
+    if (!speechPlayerStatus.didJustFinish) return;
+    const nextPart = builtInPartsRef.current.shift();
+    if (nextPart) {
+      playBuiltInPart(nextPart);
+      return;
+    }
+    builtInPlayingRef.current = false;
+    // More parts are still being made: the next one plays as soon as it is ready.
+    if (!builtInMakingRef.current) speechFinished();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [speechPlayerStatus.didJustFinish]);
 
-  useEffect(() => () => {
-    if (speakingTimer.current) clearTimeout(speakingTimer.current);
-  }, []);
   const [customWords, setCustomWords] = useState<CustomWord[]>([]);
   useEffect(() => { customWordsRef.current = customWords; }, [customWords]);
   const [pendingWords, setPendingWords] = useState<CustomWord[]>([]);
@@ -504,9 +584,9 @@ export default function App() {
       const downloadedContent = await downloadContent();
       setContent(downloadedContent);
       await writeStoredValue(offlineContentStorageKey, JSON.stringify(downloadedContent));
-      setSyncNotice('Phrases updated.');
+      setSyncNotice(t.phrasesUpdated);
     } catch {
-      setSyncNotice('No internet. Showing the phrases saved on this phone.');
+      setSyncNotice(t.noInternetPhrases);
     } finally {
       setSyncing(false);
     }
@@ -552,7 +632,7 @@ export default function App() {
       .map((word) => {
         const localCategory = categories.find((category) => category.slug === word.categoryId);
         const addedCategory = customCategories.find((category) => category.id === word.categoryId);
-        const categoryName = localCategory?.name ?? addedCategory?.name ?? 'Your words';
+        const categoryName = localCategory?.name ?? addedCategory?.name ?? uiText[language].yourWords;
 
         return {
           uuid: `custom:${word.id}`,
@@ -585,6 +665,7 @@ export default function App() {
   const speakWithPhoneVoices = async (
     attempts: { text: string; aliases: string[] }[],
     isNewest: () => boolean = () => true,
+    onAllFailed?: () => void,
   ): Promise<boolean> => {
     // The voice list is read once (see loadPhoneVoices); asking Android for it on every tap
     // added about a second before each card spoke.
@@ -602,27 +683,56 @@ export default function App() {
 
     const speakOption = (index: number) => {
       const { text, voice } = options[index];
+      // Only the newest speech may hide the "Now speaking" bar (an older one stopped by a new tap
+      // used to hide it while the new card was still speaking).
+      const finished = () => { if (isNewest()) speechFinished(); };
+      const failed = () => {
+        // A newer tap has taken over: don't fall back to another voice for this old one.
+        if (!isNewest()) return;
+        if (index + 1 < options.length) speakOption(index + 1);
+        else if (onAllFailed) onAllFailed();
+        else {
+          setSpeechError(t.phoneVoiceFailed);
+          speechFinished();
+        }
+      };
+      if (fastSpeech) {
+        // The app's own speech module: the new text replaces the current one at once.
+        const id = nextUtteranceId();
+        const handlers = utteranceHandlersRef.current;
+        // Not started in time (voice app busy or broken): stop it and use the next voice.
+        const watchdog = setTimeout(() => {
+          if (!handlers.has(id)) return;
+          handlers.delete(id);
+          if (!isNewest()) return;
+          void fastSpeech?.stop();
+          preloadBuiltInVoice();
+          failed();
+        }, phoneVoiceStartTimeoutMs);
+        handlers.set(id, {
+          started: () => clearTimeout(watchdog),
+          finished: () => { clearTimeout(watchdog); finished(); },
+          failed: () => { clearTimeout(watchdog); failed(); },
+        });
+        void fastSpeech.speak(id, text, voice.identifier, voice.language, 0.88, 1.02).catch(() => {
+          clearTimeout(watchdog);
+          handlers.delete(id);
+          failed();
+        });
+        return;
+      }
       Speech.speak(text, {
         language: voice.language,
         voice: voice.identifier,
         rate: 0.88,
         pitch: 1.02,
-        // Only the newest speech may hide the "Now speaking" bar (an older one stopped by a new tap
-        // used to hide it while the new card was still speaking).
-        onDone: () => { if (isNewest()) speechFinished(); },
-        onStopped: () => { if (isNewest()) speechFinished(); },
-        onError: () => {
-          // A newer tap has taken over: don't fall back to another voice for this old one.
-          if (!isNewest()) return;
-          if (index + 1 < options.length) speakOption(index + 1);
-          else {
-            setSpeechError('The phone voice could not speak this text.');
-            speechFinished();
-          }
-        },
+        onDone: finished,
+        onStopped: finished,
+        onError: failed,
       });
     };
-    await Speech.stop();
+    // The app's speech module replaces the current speech by itself; expo-speech needs a stop first.
+    if (!fastSpeech) await Speech.stop();
     // Another card was tapped meanwhile: let that one speak instead of queueing this one first.
     if (!isNewest()) return true;
     speakOption(0);
@@ -642,12 +752,11 @@ export default function App() {
     const requestId = speechRequestRef.current + 1;
     speechRequestRef.current = requestId;
     const isNewest = () => speechRequestRef.current === requestId;
-    // The "Now speaking" bar is shown after the voice has been started: redrawing the screen first
-    // made the voice start later.
+    // Anything still playing or waiting from the built-in voice belongs to an older text.
+    clearBuiltInParts();
+    // Clears an old error once the voice has started (after it, so redrawing never delays the voice).
     const showNowSpeaking = () => {
       setSpeechError(null);
-      setLastSpoken(text);
-      showSpeaking();
     };
 
     // Natural recordings made with Google's voice (scripts/generate-natural-audio.mjs) come first.
@@ -655,13 +764,51 @@ export default function App() {
     const bundledAudio = offlineSpeech[`${languageCode}:${speechKey}`]
       ?? (languageCode === 'ceb' ? offlineSpeech[`fil:${speechKey}`] : undefined);
     if (bundledAudio !== undefined) {
-      await Speech.stop();
+      await stopPhoneSpeech();
       if (!isNewest()) return;
       speechPlayer.replace(bundledAudio);
       speechPlayer.play();
       showNowSpeaking();
       return;
     }
+
+    // The voice inside the app, part by part: the first words play while the rest is being made.
+    // Returns false if this phone cannot use it.
+    const speakBuiltIn = async (): Promise<boolean> => {
+      if (!isNewest()) return true;
+      showNowSpeaking();
+      setSpeechLoading(true);
+      clearBuiltInParts();
+      builtInMakingRef.current = true;
+      await stopPhoneSpeech();
+      try {
+        return await speakWithBuiltInVoiceInParts(text, languageCode === 'en' ? 'fil' : languageCode, {
+          clearSpeech: true,
+          isCancelled: () => !isNewest(),
+          onPart: (uri) => {
+            if (!isNewest()) return;
+            setSpeechLoading(false);
+            if (builtInPlayingRef.current) builtInPartsRef.current.push(uri);
+            else playBuiltInPart(uri);
+          },
+        }).catch(() => false);
+      } finally {
+        if (isNewest()) {
+          builtInMakingRef.current = false;
+          setSpeechLoading(false);
+          if (!builtInPlayingRef.current) speechFinished();
+        }
+      }
+    };
+    // When every phone voice fails or does not start, the built-in voice speaks instead.
+    const useBuiltInInstead = () => {
+      void speakBuiltIn().then((spoken) => {
+        if (!spoken && isNewest()) {
+          setSpeechError(t.phoneVoiceFailed);
+          speechFinished();
+        }
+      });
+    };
 
     try {
       speechPlayer.pause();
@@ -677,42 +824,29 @@ export default function App() {
           { text: spokenText, aliases: indonesianVoiceAliases },
           { text: spokenText, aliases: speechLanguageAliases.en },
         ];
-        if (await speakWithPhoneVoices(attempts, isNewest)) {
+        if (await speakWithPhoneVoices(attempts, isNewest, useBuiltInInstead)) {
           if (isNewest()) showNowSpeaking();
           return;
         }
       }
-      if (languageCode !== 'en') {
-        // Last resort, for phones with no English voice: the voice inside the app. It takes a few
-        // seconds to get ready, so the button shows "Getting ready…" meanwhile.
-        showNowSpeaking();
-        setSpeechLoading(true);
-        const builtInAudio = await synthesizeWithBuiltInVoice(text, languageCode, { clearSpeech: true }).catch((error: unknown) => {
-          console.log('[voice] error', String(error));
-          return null;
-        });
-        if (!isNewest()) return;
-        if (builtInAudio) {
-          console.log('[voice] playing', builtInAudio);
-          await Speech.stop();
-          if (!isNewest()) return;
-          speechPlayer.replace({ uri: builtInAudio });
-          speechPlayer.play();
-          return;
-        }
+      if (languageCode === 'en' && await speakWithPhoneVoices([{ text, aliases: speechLanguageAliases.en }], isNewest, useBuiltInInstead)) {
+        if (isNewest()) showNowSpeaking();
+        return;
       }
-      if (await speakWithPhoneVoices([{ text, aliases: speechLanguageAliases[languageCode] }], isNewest)) {
+      // No usable phone voice: the voice inside the app.
+      if (Platform.OS === 'android' && await speakBuiltIn()) return;
+      if (languageCode !== 'en' && await speakWithPhoneVoices([{ text, aliases: speechLanguageAliases[languageCode] }], isNewest)) {
         if (isNewest()) showNowSpeaking();
         return;
       }
 
       setSpeechError(Platform.OS === 'web'
-        ? `This browser has no ${selectedLanguage.label} voice (computers usually lack one). Test ${selectedLanguage.label} speech on an Android phone.`
+        ? t.noVoiceWeb(selectedLanguage.label)
         : languageCode === 'en'
-          ? 'No English voice is installed on this phone. Install one in Settings › Text-to-speech.'
-          : `No ${selectedLanguage.label} voice is available offline on this phone. Open Settings › Text-to-speech › Google › Install voice data, and download Filipino. It then works without internet.`);
+          ? t.noEnglishVoice
+          : t.noOfflineVoice(selectedLanguage.label));
     } catch {
-      setSpeechError(`Could not speak this ${selectedLanguage.label} text on this phone.`);
+      setSpeechError(t.couldNotSpeak(selectedLanguage.label));
     } finally {
       setSpeechLoading(false);
     }
@@ -736,11 +870,11 @@ export default function App() {
   const addPendingWord = () => {
     const text = customWordInput.trim();
     if (!selectedCategory) {
-      setCustomWordError('Choose a category before adding a word.');
+      setCustomWordError(t.chooseCategoryFirst);
       return;
     }
     if (!text) {
-      setCustomWordError('Type a word or phrase first.');
+      setCustomWordError(t.typeWordFirst);
       return;
     }
 
@@ -751,7 +885,7 @@ export default function App() {
       && wordTextIn(word, sourceLanguage)?.toLocaleLowerCase() === text.toLocaleLowerCase()
     );
     if (isDuplicate) {
-      setCustomWordError('That word is already added in this category.');
+      setCustomWordError(t.wordAlreadyAdded);
       return;
     }
 
@@ -831,7 +965,7 @@ export default function App() {
     const englishText = wordTextIn(pendingWord, 'en')?.trim();
     const filipinoText = wordTextIn(pendingWord, 'fil')?.trim();
     if (!englishText || !filipinoText) {
-      setCustomWordError('Type the word in both English and Filipino before saving.');
+      setCustomWordError(t.typeBothLanguages);
       return;
     }
     const word: CustomWord = {
@@ -855,9 +989,9 @@ export default function App() {
       setCustomWordError(null);
       const categoryName = customCategories.find((category) => category.id === word.categoryId)?.name
         ?? categories.find((category) => category.slug === word.categoryId)?.name;
-      showToast('success', `Saved “${wordTextIn(word, language) ?? word.text}”${categoryName ? ` to ${categoryName}` : ''}`);
+      showToast('success', t.savedWord(wordTextIn(word, language) ?? word.text, categoryName ?? undefined));
     } catch {
-      setCustomWordError('Could not save this word on the device. Try again.');
+      setCustomWordError(t.couldNotSaveWord);
     }
   };
 
@@ -865,7 +999,7 @@ export default function App() {
     const discarded = pendingWords.find((word) => word.id === id);
     setPendingWords((words) => words.filter((word) => word.id !== id));
     setCustomWordError(null);
-    if (discarded) showToast('info', `Discarded “${discarded.text}”`);
+    if (discarded) showToast('info', t.discardedWord(discarded.text));
   };
 
   const storeCustomWords = async (words: CustomWord[]) => {
@@ -879,9 +1013,9 @@ export default function App() {
     try {
       await storeCustomWords(updatedWords);
       setCustomWords(updatedWords);
-      showToast('success', `Restored “${wordTextIn(word, language) ?? word.text}”`);
+      showToast('success', t.restored(wordTextIn(word, language) ?? word.text));
     } catch {
-      setCustomWordError('Could not restore this word on the device. Try again.');
+      setCustomWordError(t.couldNotRestoreWord);
     }
   };
 
@@ -894,27 +1028,27 @@ export default function App() {
       setCustomWords(updatedWords);
       setCustomWordError(null);
       if (removed) {
-        showToast('removed', `Removed “${wordTextIn(removed, language) ?? removed.text}”`, {
-          actionLabel: 'Undo',
+        showToast('removed', t.removed(wordTextIn(removed, language) ?? removed.text), {
+          actionLabel: t.undo,
           onAction: () => void restoreCustomWord(removed),
         });
       }
     } catch {
-      setCustomWordError('Could not remove this word from the device. Try again.');
+      setCustomWordError(t.couldNotRemoveWord);
     }
   };
 
   const saveCustomCategory = async () => {
     const name = customCategoryInput.trim();
     if (!name) {
-      setCustomCategoryError('Type a category name first.');
+      setCustomCategoryError(t.typeCategoryFirst);
       return;
     }
 
     const duplicate = [...categories.map((category) => category.name), ...customCategories.map((category) => category.name)]
       .some((existingName) => existingName.toLocaleLowerCase() === name.toLocaleLowerCase());
     if (duplicate) {
-      setCustomCategoryError('A category with that name already exists.');
+      setCustomCategoryError(t.categoryExists);
       return;
     }
 
@@ -937,9 +1071,9 @@ export default function App() {
       setSelectedCategory(category.id);
       // Show the new category's chip (it is added at the end of the row, often off-screen).
       setTimeout(() => chipScrollRef.current?.scrollToEnd({ animated: true }), 150);
-      showToast('success', `Category “${name}” created`);
+      showToast('success', t.categoryCreated(name));
     } catch {
-      setCustomCategoryError('Could not save this category on the device. Try again.');
+      setCustomCategoryError(t.couldNotSaveCategory);
     }
   };
 
@@ -955,12 +1089,12 @@ export default function App() {
       }
       setHiddenMessageIds(updatedIds);
       setLocalActionError(null);
-      showToast('removed', `Removed “${message.title ?? message.message_text ?? 'phrase'}”`, {
-        actionLabel: 'Undo',
+      showToast('removed', t.removed(message.title ?? message.message_text ?? t.phraseFallback), {
+        actionLabel: t.undo,
         onAction: () => void undoHideMessage(message),
       });
     } catch {
-      setLocalActionError('Could not remove that message from this device.');
+      setLocalActionError(t.couldNotRemoveMessage);
     }
   };
 
@@ -975,9 +1109,9 @@ export default function App() {
       }
       setHiddenMessageIds(updatedIds);
       setLocalActionError(null);
-      showToast('success', `Restored “${message.title ?? message.message_text ?? 'phrase'}”`);
+      showToast('success', t.restored(message.title ?? message.message_text ?? t.phraseFallback));
     } catch {
-      setLocalActionError('Could not restore that message on this device.');
+      setLocalActionError(t.couldNotRestoreMessage);
     }
   };
 
@@ -989,7 +1123,7 @@ export default function App() {
   );
   const draftLanguageLabel = voiceLabels[detectSpeechVoice(speechDraft, language)];
   const selectedCategoryName = selectedCategory?.startsWith(customCategoryPrefix)
-    ? customCategories.find((category) => category.id === selectedCategory)?.name ?? 'Custom category'
+    ? customCategories.find((category) => category.id === selectedCategory)?.name ?? t.customCategory
     : categories.find((category) => category.slug === selectedCategory)?.name ?? null;
 
   // Hand-sign size on the Speak screen (full width, same look as the cards).
@@ -997,12 +1131,23 @@ export default function App() {
   const typedSignSize = Math.max(28, Math.min(40, Math.floor((typedSignWidth + 2) / 8) - 2));
 
   // One wide card per row on phones (hand signs fit in one neat row), two side by side on tablets.
-  const columnWidth: `${number}%` = width >= 700 ? '48%' : '100%';
-  const cardWidth = width >= 700 ? Math.round((width - 32 - 12) / 2) : width - 32;
+  // Cards in columns: two on phones, three on tablets.
+  const columnCount = width >= 700 ? 3 : 2;
+  const columnWidth: `${number}%` = columnCount === 3 ? '31%' : '48%';
+  const cardWidth = Math.floor((width - 32 - 12 * (columnCount - 1)) / columnCount);
   const categoryColor = (slug: string | undefined) => categories.find((category) => category.slug === slug)?.color ?? palette.sky;
   const accentFor = useStableCallback((message: CommunicationMessage) =>
     message.is_emergency ? palette.coral : categoryColor(message.category?.slug));
-  const speakMessage = useStableCallback((message: CommunicationMessage) => speak(message));
+  // The card whose hand signs are shown big (opened by tapping a card).
+  const [signCard, setSignCard] = useState<CommunicationMessage | null>(null);
+  const speakMessage = useStableCallback((message: CommunicationMessage) => {
+    speak(message);
+    setSignCard(message);
+  });
+  const signCardTitle = signCard ? signCard.title ?? signCard.message_text ?? '' : '';
+  const signCardSentence = signCard && signCard.title && signCard.message_text !== signCard.title ? signCard.message_text : null;
+  const signSheetWidth = width - 2 * 16 - 2 * 20 - 2 * 12;
+  const signSheetSize = fitSignSize(signCardTitle, signSheetWidth, Math.round(height * 0.42), 72);
   const removeMessage = useStableCallback((message: CommunicationMessage) => {
     if (message.uuid.startsWith('custom:')) void removeCustomWord(message.uuid.slice('custom:'.length));
     else void hideMessage(message);
@@ -1031,7 +1176,7 @@ export default function App() {
               <Text numberOfLines={2} style={[styles.brandName, narrow && styles.brandNameNarrow]}>Communication Bridge</Text>
               <View style={styles.statusLine}>
                 <View style={styles.statusDot} />
-                <Text style={styles.statusText}>Offline · Ready</Text>
+                <Text style={styles.statusText}>{t.offlineReady}</Text>
               </View>
             </View>
             <View style={styles.languageSwitch} accessibilityRole="radiogroup" accessibilityLabel="Board language">
@@ -1128,8 +1273,8 @@ export default function App() {
         <FadeIn>
         <View style={styles.speakSection}>
           <View>
-            <Text accessibilityRole="header" style={styles.sectionTitle}>Speak anything</Text>
-            <Text style={styles.sectionSubtitle}>Type in English, Filipino or Bisaya, then tap Speak.</Text>
+            <Text accessibilityRole="header" style={styles.sectionTitle}>{t.speakTitle}</Text>
+            <Text style={styles.sectionSubtitle}>{t.speakSubtitle}</Text>
           </View>
 
           {/* Writing pad */}
@@ -1138,7 +1283,7 @@ export default function App() {
               accessibilityLabel="Type text to speak"
               multiline
               maxLength={1000}
-              placeholder="Type what you want to say…"
+              placeholder={t.speakPlaceholder}
               placeholderTextColor={palette.placeholder}
               value={speechDraft}
               onChangeText={setSpeechDraft}
@@ -1170,10 +1315,10 @@ export default function App() {
               {speechDraft.trim() ? (
                 <View style={styles.voicePill}>
                   <Ionicons name="volume-medium" size={14} color={palette.brand} />
-                  <Text style={styles.voicePillText}>{draftLanguageLabel} voice</Text>
+                  <Text style={styles.voicePillText}>{t.voicePill(draftLanguageLabel)}</Text>
                 </View>
               ) : (
-                <Text style={styles.padHint}>The voice is chosen for you</Text>
+                <Text style={styles.padHint}>{t.voiceChosenForYou}</Text>
               )}
               <Text style={styles.characterCount}>{speechDraft.length}/1000</Text>
               {speechDraft.length > 0 ? (
@@ -1185,7 +1330,7 @@ export default function App() {
                   style={({ pressed }) => [styles.clearButton, pressed && styles.pressed]}
                 >
                   <Ionicons name="close" size={16} color={palette.inkSoft} />
-                  <Text style={styles.clearButtonText}>Clear</Text>
+                  <Text style={styles.clearButtonText}>{t.clear}</Text>
                 </Pressable>
               ) : null}
             </View>
@@ -1204,7 +1349,7 @@ export default function App() {
               ? <ActivityIndicator color={palette.white} size="small" />
               : <Ionicons name="volume-high" size={22} color={speechDraft.trim() ? palette.white : palette.muted} />}
             <Text style={[styles.speakButtonText, !speechLoading && !speechDraft.trim() && styles.speakButtonTextDisabled]}>
-              {speechLoading ? 'Getting ready…' : 'Speak'}
+              {speechLoading ? t.gettingReady : t.speak}
             </Text>
           </Pressable>
           {speechError ? <Text accessibilityRole="alert" style={styles.errorText}>{speechError}</Text> : null}
@@ -1213,8 +1358,8 @@ export default function App() {
           {!keyboardOpen && typedSigns.text ? (
             <View style={styles.typedSignsFull}>
               <View style={styles.quickHeader}>
-                <Text style={styles.sectionLabel}>HAND SIGNS</Text>
-                {typedSigns.shortened ? <Text style={styles.quickHint}>First {maxTypedSignLetters} letters</Text> : null}
+                <Text style={styles.sectionLabel}>{t.handSigns}</Text>
+                {typedSigns.shortened ? <Text style={styles.quickHint}>{t.firstLetters(maxTypedSignLetters)}</Text> : null}
               </View>
               <SignWord
                 text={typedSigns.text}
@@ -1228,7 +1373,7 @@ export default function App() {
           {recentlySaid.length > 0 ? (
             <View style={styles.recentBlock}>
               <View style={styles.quickHeader}>
-                <Text style={styles.sectionLabel}>RECENTLY SAID</Text>
+                <Text style={styles.sectionLabel}>{t.recentlySaid}</Text>
                 <Pressable
                   accessibilityRole="button"
                   accessibilityLabel="Clear all recently said"
@@ -1236,12 +1381,12 @@ export default function App() {
                   onPress={() => {
                     const cleared = recentlySaid;
                     setRecentlySaid([]);
-                    showToast('removed', 'Cleared recently said', { actionLabel: 'Undo', onAction: () => setRecentlySaid(cleared) });
+                    showToast('removed', t.clearedRecentlySaid, { actionLabel: t.undo, onAction: () => setRecentlySaid(cleared) });
                   }}
                   style={({ pressed }) => [styles.clearButton, pressed && styles.pressed]}
                 >
                   <Ionicons name="trash-outline" size={15} color={palette.inkSoft} />
-                  <Text style={styles.clearButtonText}>Clear all</Text>
+                  <Text style={styles.clearButtonText}>{t.clearAll}</Text>
                 </Pressable>
               </View>
               <View style={styles.recentList}>
@@ -1265,13 +1410,13 @@ export default function App() {
           {Platform.OS === 'android' ? (
             <View style={styles.voiceRow}>
               <View style={styles.voiceRowCopy}>
-                <Text style={styles.voiceRowTitle}>Filipino &amp; Bisaya voice</Text>
+                <Text style={styles.voiceRowTitle}>{t.voiceRowTitle}</Text>
                 <Text style={styles.voiceRowHint}>
-                  {filipinoVoice === 'phone' ? 'Natural Filipino voice of the phone' : 'Clear voice that works on every phone'}
+                  {filipinoVoice === 'phone' ? t.voicePhoneHint : t.voiceBuiltInHint}
                 </Text>
               </View>
               <View style={styles.languageSwitch}>
-                {([['phone', 'Phone'], ['builtin', 'Built-in']] as const).map(([choice, label]) => {
+                {([['phone', t.voicePhone], ['builtin', t.voiceBuiltIn]] as const).map(([choice, label]) => {
                   const active = filipinoVoice === choice;
                   return (
                     <Pressable
@@ -1292,11 +1437,11 @@ export default function App() {
 
           <View style={styles.privacyRow}>
             <Ionicons name="lock-closed-outline" size={14} color={palette.muted} />
-            <Text style={styles.privacyText}>Works without internet. Your text never leaves this phone.</Text>
+            <Text style={styles.privacyText}>{t.privacy}</Text>
           </View>
           {/* Credits required by the licences of the bundled voice and hand drawings. */}
           <Text style={styles.creditsText}>
-            Built-in voice: Piper Filipino by IhorShevchuk (CC BY-NC-SA 4.0). Hand sign drawings: Wikimedia Commons (public domain).
+            {t.credits}
           </Text>
         </View>
 
@@ -1310,7 +1455,7 @@ export default function App() {
           <Ionicons name="search" size={20} color={palette.muted} />
           <TextInput
             accessibilityLabel="Search messages"
-            placeholder="Search words or phrases"
+            placeholder={t.searchPlaceholder}
             placeholderTextColor={palette.placeholder}
             value={search}
             onChangeText={setSearch}
@@ -1326,7 +1471,7 @@ export default function App() {
 
         {/* Categories */}
         <View style={styles.sectionHeader}>
-          <Text accessibilityRole="header" style={styles.sectionTitle}>Categories</Text>
+          <Text accessibilityRole="header" style={styles.sectionTitle}>{t.categories}</Text>
           <View style={styles.sectionActions}>
             <Pressable
               accessibilityRole="button"
@@ -1343,13 +1488,13 @@ export default function App() {
               style={({ pressed }) => [styles.addCategoryButton, pressed && styles.pressed]}
             >
               <Ionicons name="add" size={18} color={palette.white} />
-              <Text style={styles.addCategoryText}>New</Text>
+              <Text style={styles.addCategoryText}>{t.newCategory}</Text>
             </Pressable>
           </View>
         </View>
         <ScrollView ref={chipScrollRef} horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.chipRow}>
           <CategoryChip
-            label="All"
+            label={t.all}
             count={categoryCounts.total}
             color={palette.ink}
             selected={selectedCategory === null}
@@ -1381,7 +1526,7 @@ export default function App() {
           <View style={[styles.inlineForm, styles.categoryForm]}>
             <TextInput
               accessibilityLabel="New category name"
-              placeholder="Name your category"
+              placeholder={t.categoryNamePlaceholder}
               placeholderTextColor={palette.placeholder}
               value={customCategoryInput}
               onChangeText={(text) => { setCustomCategoryInput(text); setCustomCategoryError(null); }}
@@ -1397,7 +1542,7 @@ export default function App() {
               onPress={() => void saveCustomCategory()}
               style={[styles.primarySmall, (!customWordsReady || !customCategoryInput.trim()) && styles.speakButtonDisabled]}
             >
-              <Text style={styles.primarySmallText}>Create</Text>
+              <Text style={styles.primarySmallText}>{t.create}</Text>
             </Pressable>
             {customCategoryError ? <Text style={styles.errorText}>{customCategoryError}</Text> : null}
           </View>
@@ -1411,15 +1556,15 @@ export default function App() {
                 <Ionicons name="add-circle" size={22} color={palette.green} />
               </View>
               <View style={styles.cardHeaderCopy}>
-                <Text accessibilityRole="header" style={styles.cardTitle}>{selectedCategoryName ? `Add to ${selectedCategoryName}` : 'Your words'}</Text>
-                <Text style={styles.cardSubtitle}>{`${savedWordsForLanguage.length} saved · translated to English and Filipino`}</Text>
+                <Text accessibilityRole="header" style={styles.cardTitle}>{selectedCategoryName ? t.addTo(selectedCategoryName) : t.yourWords}</Text>
+                <Text style={styles.cardSubtitle}>{t.savedCount(savedWordsForLanguage.length)}</Text>
               </View>
             </View>
             <View style={styles.inlineForm}>
               <TextInput
                 accessibilityLabel="Add a word or phrase to the selected category"
                 editable={customWordsReady}
-                placeholder="Type a word or phrase"
+                placeholder={t.wordPlaceholder}
                 placeholderTextColor={palette.placeholder}
                 value={customWordInput}
                 onChangeText={(text) => { setCustomWordInput(text); setCustomWordError(null); }}
@@ -1436,13 +1581,13 @@ export default function App() {
                 onPress={addPendingWord}
                 style={[styles.primarySmall, (!customWordsReady || !customWordInput.trim()) && styles.speakButtonDisabled]}
               >
-                <Text style={styles.primarySmallText}>Add</Text>
+                <Text style={styles.primarySmallText}>{t.add}</Text>
               </Pressable>
             </View>
             {customWordError ? <Text style={styles.errorText}>{customWordError}</Text> : null}
             {pendingWordsForLanguage.length > 0 ? (
               <View style={styles.pendingList}>
-                <Text style={styles.sectionLabel}>CHECK AND SAVE</Text>
+                <Text style={styles.sectionLabel}>{t.checkAndSave}</Text>
                 {pendingWordsForLanguage.map((word) => (
                   <View key={word.id} style={styles.pendingCard}>
                     {languages.map((item) => (
@@ -1469,26 +1614,26 @@ export default function App() {
                     {translatingWordIds.includes(word.id) ? (
                       <View style={styles.hintRow}>
                         <ActivityIndicator size="small" color={palette.brand} />
-                        <Text style={styles.hintText}>Translating…</Text>
+                        <Text style={styles.hintText}>{t.translating}</Text>
                       </View>
                     ) : word.machineTranslated ? (
                       <View style={styles.hintRow}>
                         <Ionicons name="sparkles" size={14} color={palette.brand} />
-                        <Text style={styles.hintText}>Translated automatically. Please check it is right.</Text>
+                        <Text style={styles.hintText}>{t.translatedCheck}</Text>
                       </View>
                     ) : word.needsTranslationCheck ? (
                       <Text style={styles.warningText}>
-                        No automatic translation found. Names and food often stay the same; otherwise type the translation above.
+                        {t.noTranslation}
                         {translatorStatus === 'missing' || translatorStatus === 'failed' ? (
                           <>
                             {' '}
-                            <Text style={styles.linkText} onPress={() => void downloadTranslatorNow()}>Download translator</Text>
+                            <Text style={styles.linkText} onPress={() => void downloadTranslatorNow()}>{t.downloadTranslator}</Text>
                             {translatorStatus === 'failed'
-                              ? ' (needs internet once, about 30 MB; please connect and try again).'
-                              : ' (once, about 30 MB) to translate any sentence offline.'}
+                              ? t.translatorFailed
+                              : t.translatorOffer}
                           </>
                         ) : null}
-                        {translatorStatus === 'downloading' ? ' Downloading translator…' : null}
+                        {translatorStatus === 'downloading' ? t.translatorDownloading : null}
                       </Text>
                     ) : null}
                     <View style={styles.pendingActions}>
@@ -1498,7 +1643,7 @@ export default function App() {
                         onPress={() => discardPendingWord(word.id)}
                         style={({ pressed }) => [styles.ghostButton, pressed && styles.pressed]}
                       >
-                        <Text style={styles.ghostButtonText}>Discard</Text>
+                        <Text style={styles.ghostButtonText}>{t.discard}</Text>
                       </Pressable>
                       <Pressable
                         accessibilityRole="button"
@@ -1507,14 +1652,14 @@ export default function App() {
                         style={({ pressed }) => [styles.primarySmall, pressed && styles.pressed]}
                       >
                         <Ionicons name="checkmark" size={18} color={palette.white} />
-                        <Text style={styles.primarySmallText}>Save</Text>
+                        <Text style={styles.primarySmallText}>{t.save}</Text>
                       </Pressable>
                     </View>
                   </View>
                 ))}
               </View>
             ) : (
-              <Text style={styles.helperText}>Add a word, check the translation, then save. It appears on the board below with its hand signs.</Text>
+              <Text style={styles.helperText}>{t.addHelper}</Text>
             )}
           </View>
         ) : null}
@@ -1522,8 +1667,8 @@ export default function App() {
         {/* Communication board */}
         <View style={styles.sectionHeader}>
           <View>
-            <Text accessibilityRole="header" style={styles.sectionTitle}>{selectedCategoryName ?? 'Communication board'}</Text>
-            <Text style={styles.sectionSubtitle}>{`${visibleMessages.length} ${visibleMessages.length === 1 ? 'phrase' : 'phrases'} · tap to speak · hold to remove`}</Text>
+            <Text accessibilityRole="header" style={styles.sectionTitle}>{selectedCategoryName ?? t.boardTitle}</Text>
+            <Text style={styles.sectionSubtitle}>{t.phraseCount(visibleMessages.length)}</Text>
           </View>
         </View>
 
@@ -1533,8 +1678,8 @@ export default function App() {
         {visibleMessages.length === 0 ? (
           <View style={styles.emptyState}>
             <View style={styles.emptyIcon}><Ionicons name="search" size={28} color={palette.brand} /></View>
-            <Text style={styles.emptyTitle}>No phrases found</Text>
-            <Text style={styles.helperText}>Try another word or choose a different category.</Text>
+            <Text style={styles.emptyTitle}>{t.noPhrases}</Text>
+            <Text style={styles.helperText}>{t.noPhrasesHint}</Text>
           </View>
         ) : (
           <BoardList
@@ -1545,12 +1690,13 @@ export default function App() {
             accentFor={accentFor}
             onSpeak={speakMessage}
             onRemove={removeMessage}
+            text={t}
           />
         )}
 
         <View style={styles.footer}>
           <Image source={require('./assets/logo.png')} style={styles.footerLogo} resizeMode="contain" />
-          <Text style={styles.footerText}>Your words stay on this phone, ready whenever you need them.</Text>
+          <Text style={styles.footerText}>{t.footer}</Text>
         </View>
         </FadeIn>
         ) : null}
@@ -1560,19 +1706,6 @@ export default function App() {
       {/* Brand-coloured strip behind the phone's status bar, so scrolled content never sits under the clock. */}
       <View pointerEvents="none" style={styles.statusBarShade} />
 
-      {/* Now speaking */}
-      {lastSpoken ? (
-        <SlideUp visible={speakingVisible} style={[styles.nowSpeaking, { bottom: 8 + 56 + 1 + 12 + bottomInset }]}>
-          <View style={styles.nowSpeakingAccent} />
-          <View style={styles.nowSpeakingIcon}>
-            <Ionicons name="volume-high" size={20} color={palette.brand} />
-          </View>
-          <View style={styles.nowSpeakingCopy}>
-            <Text style={styles.nowSpeakingLabel}>Now speaking</Text>
-            <Text numberOfLines={2} style={styles.nowSpeakingText}>{lastSpoken}</Text>
-          </View>
-        </SlideUp>
-      ) : null}
 
       <TabBar
         active={activeTab}
@@ -1582,7 +1715,60 @@ export default function App() {
           setActiveTab(tab);
         }}
         bottomInset={bottomInset}
+        text={t}
       />
+
+      {/* A tapped card's hand signs, big, in a panel from the bottom. */}
+      <Modal
+        visible={signCard !== null}
+        transparent
+        animationType="slide"
+        statusBarTranslucent
+        onRequestClose={() => setSignCard(null)}
+      >
+        <View style={styles.signSheetBackdrop}>
+          <Pressable accessibilityRole="button" accessibilityLabel={t.close} style={styles.signSheetDismiss} onPress={() => setSignCard(null)} />
+          {signCard ? (
+            <View style={[styles.signSheet, { paddingBottom: 16 + bottomInset }]}>
+              <View style={[styles.signSheetStripe, { backgroundColor: accentFor(signCard) }]} />
+              <View style={styles.signSheetHeader}>
+                <View style={styles.signSheetHeading}>
+                  <Text style={styles.sectionLabel}>{t.handSigns}</Text>
+                  <Text accessibilityRole="header" style={styles.signSheetTitle}>{signCardTitle}</Text>
+                  {signCardSentence ? <Text style={styles.signSheetSentence}>{signCardSentence}</Text> : null}
+                </View>
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel={t.close}
+                  hitSlop={8}
+                  onPress={() => setSignCard(null)}
+                  style={({ pressed }) => [styles.signSheetClose, pressed && styles.pressed]}
+                >
+                  <Ionicons name="close" size={24} color={palette.ink} />
+                </Pressable>
+              </View>
+              <View style={styles.signSheetSigns}>
+                {signSheetSize > 0 ? (
+                  <SignWord
+                    text={signCardTitle}
+                    size={signSheetSize}
+                    maxPerLine={signLettersPerLine(signSheetWidth, signSheetSize)}
+                  />
+                ) : null}
+              </View>
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel={t.speakAgain}
+                onPress={() => speak(signCard)}
+                style={({ pressed }) => [styles.speakButton, { backgroundColor: accentFor(signCard) }, pressed && styles.tilePressed]}
+              >
+                <Ionicons name="volume-high" size={22} color={palette.white} />
+                <Text style={styles.speakButtonText}>{t.speakAgain}</Text>
+              </Pressable>
+            </View>
+          ) : null}
+        </View>
+      </Modal>
 
       <Toast toast={toast} top={(RNStatusBar.currentHeight ?? 24) + 12} onHide={hideToast} />
     </View>
@@ -1641,6 +1827,7 @@ function useStableCallback<Args extends unknown[], Result>(callback: (...args: A
 }
 
 type CardHandlers = {
+  text: UiText;
   accentFor: (message: CommunicationMessage) => string;
   onSpeak: (message: CommunicationMessage) => void;
   onRemove: (message: CommunicationMessage) => void;
@@ -1649,7 +1836,7 @@ type CardHandlers = {
 // Renders the first cards at once and the rest in small batches just after, so the board opens
 // instantly even with many phrases. Remounts (via key) when the category or language changes.
 const firstBatch = 12;
-const BoardList = memo(function BoardList({ messages, columnWidth, cardWidth, accentFor, onSpeak, onRemove }: CardHandlers & {
+const BoardList = memo(function BoardList({ messages, columnWidth, cardWidth, text, accentFor, onSpeak, onRemove }: CardHandlers & {
   messages: CommunicationMessage[];
   columnWidth: `${number}%`;
   cardWidth: number;
@@ -1662,34 +1849,27 @@ const BoardList = memo(function BoardList({ messages, columnWidth, cardWidth, ac
     return () => clearTimeout(timer);
   }, [messages.length, renderCount]);
 
-  // Cards are placed in separate columns (each card goes to the shortest one), so every card is only
-  // as tall as its own content: no stretched cards with empty space.
-  const columnCount = columnWidth === '48%' ? 2 : 1;
-  const columns = useMemo(() => {
-    const lists: { message: CommunicationMessage; index: number }[][] = Array.from({ length: columnCount }, () => []);
-    const heights = new Array<number>(columnCount).fill(0);
-    messages.slice(0, renderCount).forEach((message, index) => {
-      const shortest = heights.indexOf(Math.min(...heights));
-      lists[shortest].push({ message, index });
-      heights[shortest] += estimateCardHeight(message, cardWidth) + 14;
-    });
-    return lists;
-  }, [messages, renderCount, columnCount, cardWidth]);
-
+  // Boxes in rows: two per row on phones, three on tablets. The cards in a row share one height,
+  // set by the card with the most text, so text never overlaps and the rows stay even.
+  const perRow = columnWidth === '48%' ? 2 : columnWidth === '100%' ? 1 : 3;
+  const shown = messages.slice(0, renderCount);
+  const rows: CommunicationMessage[][] = [];
+  for (let start = 0; start < shown.length; start += perRow) rows.push(shown.slice(start, start + perRow));
   return (
     <View style={styles.board}>
-      {columns.map((column, columnIndex) => (
-        <View key={columnIndex} style={styles.boardColumn}>
-          {column.map(({ message, index }) => (
+      {rows.map((row, rowIndex) => (
+        <View key={row[0].uuid} style={styles.boardRow}>
+          {row.map((message, column) => (
             <PhraseCard
               key={message.uuid}
               message={message}
-              index={index}
-              columnWidth="100%"
+              index={rowIndex * perRow + column}
+              columnWidth={columnWidth}
               cardWidth={cardWidth}
               accentFor={accentFor}
               onSpeak={onSpeak}
               onRemove={onRemove}
+              text={text}
             />
           ))}
         </View>
@@ -1698,24 +1878,38 @@ const BoardList = memo(function BoardList({ messages, columnWidth, cardWidth, ac
   );
 });
 
-// A rough card height (in dp) from its text and hand signs, used only to keep the columns even.
-function estimateCardHeight(message: CommunicationMessage, cardWidth: number): number {
-  const inner = cardWidth - cardPaddingLeft - cardPaddingRight;
-  const title = message.title ?? message.message_text ?? '';
-  const titleLines = Math.max(1, Math.ceil((title.length * 11) / Math.max(40, inner - 50)));
-  let height = 2 * 14 + titleLines * 24 + (message.is_emergency ? 18 : 0);
-  if (message.title && message.message_text && message.message_text !== message.title) {
-    height += 10 + Math.min(3, Math.ceil((message.message_text.length * 8.5) / inner)) * 22;
+// Every card is a box of the same size: a bit taller than wide.
+function boxHeightFor(cardWidth: number): number {
+  return Math.round(cardWidth * 0.95);
+}
+
+// The biggest hand-sign size at which the whole word (or phrase) fits in the box's sign area,
+// placed the way SignWord places it: long words split into even lines, short words share a line.
+function fitSignSize(title: string, width: number, height: number, largest = 44): number {
+  const words = title.split(/\s+/).map((word) => word.replace(/[^a-zñ]/gi, '').length).filter((length) => length > 0);
+  if (words.length === 0) return 0;
+  for (let size = largest; size > 12; size -= 2) {
+    const perLine = Math.max(1, Math.floor((width + 2) / (size + 2)));
+    let rows = 0;
+    let lineWidth = 0;
+    for (const letters of words) {
+      if (letters > perLine) {
+        rows += Math.ceil(letters / perLine);
+        lineWidth = 0;
+        continue;
+      }
+      const wordWidth = letters * (size + 2);
+      if (lineWidth > 0 && lineWidth + 14 + wordWidth <= width) {
+        lineWidth += 14 + wordWidth;
+      } else {
+        rows += 1;
+        lineWidth = wordWidth;
+      }
+    }
+    const rowHeight = size + Math.max(8, Math.round(size * 0.36)) * 1.35 + 1;
+    if (rows * rowHeight + (rows - 1) * 8 <= height) return size;
   }
-  const signWidth = inner - 2 * signPanelPadding;
-  const size = signSizeFor(signWidth);
-  const perLine = signLettersPerLine(signWidth, size);
-  const signRows = title.split(/\s+/)
-    .map((word) => [...word.replace(/[^a-zñ]/gi, '')])
-    .filter((letters) => letters.length > 0)
-    .reduce((rows, letters) => rows + evenLines(letters, perLine).length, 0);
-  if (signRows > 0) height += 10 + 20 + signRows * (size + Math.round(size * 0.36) * 1.4 + 6);
-  return height + 10 + 36;
+  return 12;
 }
 
 // Card title size: 20 px, smaller only when the longest word would not fit on one line
@@ -1723,7 +1917,7 @@ function estimateCardHeight(message: CommunicationMessage, cardWidth: number): n
 function titleSizeFor(title: string, cardWidth: number): { fontSize: number; lineHeight: number } {
   const longestWord = Math.max(1, ...title.split(/\s+/).map((word) => word.length));
   const titleWidth = cardWidth - cardPaddingLeft - cardPaddingRight;
-  const fontSize = Math.max(14, Math.min(24, Math.floor(titleWidth / (longestWord * 0.64 * PixelRatio.getFontScale()))));
+  const fontSize = Math.max(16, Math.min(cardWidth < 260 ? 24 : 28, Math.floor(titleWidth / (longestWord * 0.64 * PixelRatio.getFontScale()))));
   return { fontSize, lineHeight: Math.round(fontSize * 1.2) };
 }
 
@@ -1733,19 +1927,11 @@ function signLettersPerLine(availableWidth: number, size: number): number {
 }
 
 // Card spacing (shared by the card layout and the size calculations below).
-const cardPaddingLeft = 22;
-const cardPaddingRight = 16;
+const cardPaddingLeft = 18;
+const cardPaddingRight = 12;
 const signPanelPadding = 8;
 
-// Hand-sign size: the same on every card, short word or long. On a phone 6 hands fit on a line,
-// so most words sit in one neat row; longer words continue on the next line, split evenly.
-function signSizeFor(availableWidth: number): number {
-  const perLine = availableWidth < 280 ? 5 : 6;
-  return Math.max(30, Math.min(48, Math.floor((availableWidth + 2) / perLine) - 2));
-}
-
-// One phrase card; only redraws when its own phrase changes. Tapping anywhere on it speaks.
-const PhraseCard = memo(function PhraseCard({ message, index, columnWidth, cardWidth, accentFor, onSpeak, onRemove }: CardHandlers & {
+const PhraseCard = memo(function PhraseCard({ message, index, columnWidth, cardWidth, text: t, accentFor, onSpeak, onRemove }: CardHandlers & {
   message: CommunicationMessage;
   index: number;
   columnWidth: `${number}%`;
@@ -1754,28 +1940,31 @@ const PhraseCard = memo(function PhraseCard({ message, index, columnWidth, cardW
   const accent = accentFor(message);
   const title = message.title ?? message.message_text ?? '';
   const spokenText = message.message_text ?? message.title ?? 'message';
-  const signWidth = cardWidth - cardPaddingLeft - cardPaddingRight - 2 * signPanelPadding;
-  const signSize = signSizeFor(signWidth);
-  const categoryName = message.category?.name ?? 'Message';
+  // Every card is a box of the same size showing only the words; tapping it speaks and opens its
+  // hand signs, big (see the hand-sign panel in App).
+  const boxHeight = boxHeightFor(cardWidth);
+  const titleStyle = titleSizeFor(title, cardWidth);
+  const sentence = message.title && message.message_text !== message.title ? message.message_text : null;
+  const categoryName = message.category?.name ?? t.message;
   // Removing is a long press with a confirmation, so a quick tap can only ever speak.
   const confirmRemove = () => {
-    Alert.alert(`Remove “${title}”?`, 'It will be hidden from the board on this phone.', [
-      { text: 'Cancel', style: 'cancel' },
-      { text: 'Remove', style: 'destructive', onPress: () => onRemove(message) },
+    Alert.alert(t.removeTitle(title), t.removeBody, [
+      { text: t.cancel, style: 'cancel' },
+      { text: t.remove, style: 'destructive', onPress: () => onRemove(message) },
     ]);
   };
   return (
-    <FadeIn delay={Math.min(index, 8) * 45} style={{ width: columnWidth }}>
+    <FadeIn delay={Math.min(index, 8) * 45} style={{ width: cardWidth }}>
       <Pressable
         accessibilityRole="button"
         accessibilityLabel={`Speak: ${spokenText}`}
-        accessibilityHint="Hold to remove this card"
-        accessibilityActions={[{ name: 'longpress', label: 'Remove this card' }]}
+        accessibilityHint={t.holdToRemove}
+        accessibilityActions={[{ name: 'longpress', label: t.remove }]}
         onAccessibilityAction={(event) => { if (event.nativeEvent.actionName === 'longpress') confirmRemove(); }}
         onPress={() => onSpeak(message)}
         onLongPress={confirmRemove}
         delayLongPress={500}
-        style={({ pressed }) => [styles.phraseCard, message.is_emergency && styles.phraseCardEmergency, pressed && styles.cardPressed]}
+        style={({ pressed }) => [styles.phraseCard, { minHeight: boxHeight }, message.is_emergency && styles.phraseCardEmergency, pressed && styles.cardPressed]}
       >
         {/* Category colour stripe */}
         <View style={[styles.cardStripe, { backgroundColor: accent }]} />
@@ -1786,32 +1975,33 @@ const PhraseCard = memo(function PhraseCard({ message, index, columnWidth, cardW
               ? <Ionicons name="alert-circle" size={14} color={palette.coral} />
               : <View style={[styles.categoryDot, { backgroundColor: accent }]} />}
             <Text numberOfLines={1} style={[styles.cardCategoryText, message.is_emergency && styles.cardCategoryEmergency]}>
-              {message.is_emergency ? 'EMERGENCY' : categoryName.toLocaleUpperCase()}
+              {message.is_emergency ? t.emergency : categoryName.toLocaleUpperCase()}
             </Text>
           </View>
           <View accessibilityElementsHidden importantForAccessibility="no-hide-descendants" style={[styles.speakBadge, { backgroundColor: accent }]}>
-            <Ionicons name="volume-high" size={20} color={palette.white} />
+            <Ionicons name="volume-high" size={18} color={palette.white} />
           </View>
         </View>
 
-        <Text style={[styles.phraseTitle, titleSizeFor(title, cardWidth)]}>{title}</Text>
-        {message.title && message.message_text !== message.title ? (
-          <Text numberOfLines={3} style={styles.phraseText}>{message.message_text}</Text>
-        ) : null}
+        <View style={styles.cardWords}>
+          <Text style={[styles.phraseTitle, titleStyle]}>{title}</Text>
+          {sentence ? <Text numberOfLines={3} style={styles.phraseText}>{sentence}</Text> : null}
+        </View>
 
-        {/* The card's word in sign language (fingerspelled), made automatically for any word. */}
-        <View style={[styles.signPanel, message.is_emergency && styles.signPanelEmergency]}>
-          <SignWord text={title} size={signSize} maxPerLine={signLettersPerLine(signWidth, signSize)} />
+        {/* Hint: tapping shows the hand signs. */}
+        <View style={styles.cardSignHint}>
+          <Ionicons name="hand-left-outline" size={14} color={palette.muted} />
+          <Text numberOfLines={1} style={styles.cardSignHintText}>{t.handSigns}</Text>
         </View>
       </Pressable>
     </FadeIn>
   );
 });
 
-function TabBar({ active, onChange, bottomInset }: { active: 'board' | 'speak'; onChange: (tab: 'board' | 'speak') => void; bottomInset: number }) {
+function TabBar({ active, onChange, bottomInset, text }: { active: 'board' | 'speak'; onChange: (tab: 'board' | 'speak') => void; bottomInset: number; text: UiText }) {
   const tabs = [
-    { key: 'board' as const, label: 'Board', icon: 'grid' as const, iconOutline: 'grid-outline' as const },
-    { key: 'speak' as const, label: 'Speak', icon: 'chatbubble-ellipses' as const, iconOutline: 'chatbubble-ellipses-outline' as const },
+    { key: 'board' as const, label: text.tabBoard, icon: 'grid' as const, iconOutline: 'grid-outline' as const },
+    { key: 'speak' as const, label: text.tabSpeak, icon: 'chatbubble-ellipses' as const, iconOutline: 'chatbubble-ellipses-outline' as const },
   ];
   return (
     <View accessibilityRole="tablist" style={[styles.tabBar, { paddingBottom: bottomInset }]}>
@@ -2058,20 +2248,23 @@ const styles = StyleSheet.create({
   emptyIcon: { width: 64, height: 64, borderRadius: 32, backgroundColor: palette.brandSoft, alignItems: 'center', justifyContent: 'center' },
   emptyTitle: { color: palette.ink, fontFamily: fonts.bold, fontSize: 18 },
 
-  board: { flexDirection: 'row', alignItems: 'flex-start', gap: 12, paddingHorizontal: 16 },
-  boardColumn: { flex: 1, gap: 14 },
-  phraseCard: { overflow: 'hidden', backgroundColor: palette.surface, borderRadius: 22, paddingTop: 14, paddingBottom: 16, paddingLeft: cardPaddingLeft, paddingRight: cardPaddingRight, gap: 6, borderWidth: 1, borderColor: palette.line, ...cardShadow },
+  board: { gap: 12, paddingHorizontal: 16 },
+  boardRow: { flexDirection: 'row', alignItems: 'stretch', gap: 12 },
+  phraseCard: { flex: 1, overflow: 'hidden', backgroundColor: palette.surface, borderRadius: 20, paddingTop: 12, paddingBottom: 14, paddingLeft: cardPaddingLeft, paddingRight: cardPaddingRight, gap: 6, borderWidth: 1, borderColor: palette.line, ...cardShadow },
   phraseCardEmergency: { backgroundColor: '#FFF7F5', borderColor: '#F5CDC8' },
   cardPressed: { transform: [{ scale: 0.985 }], opacity: 0.94 },
   cardStripe: { position: 'absolute', left: 0, top: 0, bottom: 0, width: 6 },
-  cardTop: { flexDirection: 'row', alignItems: 'center', gap: 10 },
+  cardTop: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   cardCategory: { flex: 1, flexDirection: 'row', alignItems: 'center', gap: 6 },
-  cardCategoryText: { flexShrink: 1, color: palette.inkSoft, fontFamily: fonts.bold, fontSize: 12, letterSpacing: 0.8 },
+  cardCategoryText: { flexShrink: 1, color: palette.inkSoft, fontFamily: fonts.bold, fontSize: 11, lineHeight: 14, letterSpacing: 0.5 },
   cardCategoryEmergency: { color: palette.coral },
-  speakBadge: { width: 44, height: 44, borderRadius: 22, alignItems: 'center', justifyContent: 'center' },
-  phraseTitle: { color: palette.ink, fontFamily: fonts.bold, fontSize: 24, lineHeight: 29, letterSpacing: -0.4 },
-  phraseText: { color: palette.inkSoft, fontFamily: fonts.regular, fontSize: 16, lineHeight: 22 },
-  signPanel: { marginTop: 6, backgroundColor: palette.canvas, borderRadius: 16, paddingHorizontal: signPanelPadding, paddingVertical: 10 },
+  speakBadge: { width: 38, height: 38, borderRadius: 19, alignItems: 'center', justifyContent: 'center' },
+  phraseTitle: { color: palette.ink, fontFamily: fonts.bold, fontSize: 20, lineHeight: 24, letterSpacing: -0.3 },
+  phraseText: { color: palette.inkSoft, fontFamily: fonts.regular, fontSize: 15, lineHeight: 20 },
+  cardWords: { flexGrow: 1, justifyContent: 'center', gap: 4, paddingVertical: 4 },
+  cardSignHint: { flexDirection: 'row', alignItems: 'center', gap: 4 },
+  cardSignHintText: { color: palette.muted, fontFamily: fonts.bold, fontSize: 10, letterSpacing: 0.6 },
+  signPanel: { flex: 1, marginTop: 6, justifyContent: 'center', overflow: 'hidden', backgroundColor: palette.canvas, borderRadius: 14, paddingHorizontal: signPanelPadding, paddingVertical: 10 },
   signPanelEmergency: { backgroundColor: palette.coralSoft },
   categoryDot: { width: 7, height: 7, borderRadius: 4 },
 
@@ -2093,10 +2286,14 @@ const styles = StyleSheet.create({
   footerLogo: { width: 72, height: 40, opacity: 0.9 },
   footerText: { color: palette.muted, fontFamily: fonts.regular, fontSize: 13, textAlign: 'center' },
 
-  nowSpeaking: { position: 'absolute', left: 16, right: 16, flexDirection: 'row', alignItems: 'center', gap: 12, paddingVertical: 12, paddingLeft: 18, paddingRight: 16, overflow: 'hidden', borderRadius: 18, backgroundColor: palette.surface, borderWidth: 1, borderColor: palette.line, ...cardShadow, elevation: 8 },
-  nowSpeakingAccent: { position: 'absolute', left: 0, top: 0, bottom: 0, width: 5, backgroundColor: palette.brand },
-  nowSpeakingIcon: { width: 42, height: 42, borderRadius: 14, backgroundColor: palette.brandSoft, alignItems: 'center', justifyContent: 'center' },
-  nowSpeakingCopy: { flex: 1, gap: 1 },
-  nowSpeakingLabel: { color: palette.brand, fontFamily: fonts.bold, fontSize: 12 },
-  nowSpeakingText: { color: palette.ink, fontFamily: fonts.bold, fontSize: 17 },
+  signSheetBackdrop: { flex: 1, justifyContent: 'flex-end', backgroundColor: 'rgba(15, 27, 61, 0.45)' },
+  signSheetDismiss: { flex: 1 },
+  signSheet: { overflow: 'hidden', gap: 16, paddingTop: 20, paddingHorizontal: 20, borderTopLeftRadius: 28, borderTopRightRadius: 28, backgroundColor: palette.surface },
+  signSheetStripe: { position: 'absolute', top: 0, left: 0, right: 0, height: 6 },
+  signSheetHeader: { flexDirection: 'row', alignItems: 'flex-start', gap: 12 },
+  signSheetHeading: { flex: 1, gap: 4 },
+  signSheetTitle: { color: palette.ink, fontFamily: fonts.bold, fontSize: 28, lineHeight: 34, letterSpacing: -0.5 },
+  signSheetSentence: { color: palette.inkSoft, fontFamily: fonts.regular, fontSize: 17, lineHeight: 23 },
+  signSheetClose: { width: 44, height: 44, borderRadius: 22, alignItems: 'center', justifyContent: 'center', backgroundColor: palette.canvas },
+  signSheetSigns: { alignItems: 'center', justifyContent: 'center', paddingVertical: 16, paddingHorizontal: 12, borderRadius: 20, backgroundColor: palette.canvas },
 });

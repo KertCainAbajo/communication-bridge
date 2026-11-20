@@ -112,7 +112,8 @@ function getEngine(tts: TtsModule): Promise<TtsEngine> {
     const engine = await tts.createTTS({
       modelPath: { type: 'asset', path: modelFolder },
       modelType: 'vits',
-      numThreads: 2,
+      // Up to 4 processor cores (almost every phone since 2016 has at least 4): words are made faster.
+      numThreads: 4,
       // Steadier and slower than the voice's defaults (0.667 / 0.8 / 1.0), so words are easier to understand.
       modelOptions: { vits: { noiseScale: 0.5, noiseScaleW: 0.6, lengthScale: speakingSlowness } },
     });
@@ -210,6 +211,81 @@ function cacheKey(text: string, voice: string): string {
     second = (Math.imul(second, 31) + code) | 0;
   }
   return `${voice}-${recordingVersion}-${(first >>> 0).toString(36)}${(second >>> 0).toString(36)}-${text.length}`;
+}
+
+// Loads the voice in the background (a few seconds on cheap phones), so the first sentence spoken
+// with it does not wait for loading. Safe to call many times.
+export function preloadBuiltInVoice(): void {
+  const modules = loadNativeModules();
+  if (!modules) return;
+  queue = queue.catch(() => undefined).then(async () => {
+    await checkPreviousCrash(modules.fs);
+    if (!isBuiltInVoiceDisabled()) await getEngine(modules.tts);
+  }).catch(() => undefined);
+}
+
+// Speaks part by part so the voice starts quickly: the first few words are made into a recording
+// and handed over (onPart) to play at once, and the rest is made while they play, a few words at a
+// time. Stops making parts as soon as isCancelled() says a newer text was asked for.
+// Returns false if the built-in voice is not available.
+export function speakWithBuiltInVoiceInParts(
+  text: string,
+  voice: BuiltInVoice,
+  options: { clearSpeech?: boolean; isCancelled: () => boolean; onPart: (uri: string, isLast: boolean) => void },
+): Promise<boolean> {
+  const clearSpeech = options.clearSpeech ?? true;
+  const modules = loadNativeModules();
+  if (!modules) return Promise.resolve(false);
+
+  const task = queue.catch(() => undefined).then(async () => {
+    if (options.isCancelled()) return true;
+    await checkPreviousCrash(modules.fs);
+    if (isBuiltInVoiceDisabled()) return false;
+    const engine = await getEngine(modules.tts);
+    const sentences = splitForPauses(prepareForSpeech(text, voice));
+    const pieces = clearSpeech ? splitIntoWords(sentences) : sentences;
+    if (pieces.length === 0) return false;
+    // First part: 2 words (heard quickly); later parts: up to 6 words.
+    const groups: { text: string; pauseSeconds: number }[][] = [];
+    for (let index = 0; index < pieces.length;) {
+      const size = groups.length === 0 ? 2 : 6;
+      groups.push(pieces.slice(index, index + size));
+      index += size;
+    }
+    for (let groupIndex = 0; groupIndex < groups.length; groupIndex += 1) {
+      if (options.isCancelled()) return true;
+      const group = groups[groupIndex];
+      const isFirst = groupIndex === 0;
+      const isLast = groupIndex === groups.length - 1;
+      const key = cacheKey(`${group.map((piece) => piece.text).join(' ')}|${isFirst ? 'first' : ''}|${isLast ? 'last' : ''}`, `${voice}-${clearSpeech ? 'clear' : 'natural'}-part`);
+      const filePath = `${modules.fs.CachesDirectoryPath}/${key}.wav`;
+      if (!(await modules.fs.exists(filePath))) {
+        markStep('speak');
+        try {
+          const samples: number[] = [];
+          let sampleRate = engine.getSampleRate ? await engine.getSampleRate() : 22050;
+          if (isFirst) pushSilence(samples, sampleRate, leadingSilenceSeconds);
+          for (const piece of group) {
+            if (options.isCancelled()) return true;
+            const audio = await engine.generateSpeech(piece.text, clearSpeech ? { speed: clearSpeechWordSpeed } : undefined);
+            sampleRate = audio.sampleRate;
+            const spoken = clearSpeech ? trimSilence(audio.samples, sampleRate) : audio.samples;
+            for (const sample of fadeOut(spoken, sampleRate)) samples.push(sample);
+            pushSilence(samples, sampleRate, piece.pauseSeconds);
+          }
+          if (isLast) pushSilence(samples, sampleRate, trailingSilenceSeconds);
+          await modules.tts.saveAudioToFile({ samples: makeStrong(samples), sampleRate }, filePath);
+        } finally {
+          markStep(null); // Reached unless the app crashed.
+        }
+      }
+      if (options.isCancelled()) return true;
+      options.onPart(`file://${filePath}`, isLast);
+    }
+    return true;
+  });
+  queue = task.catch(() => undefined);
+  return task;
 }
 
 // Returns a file:// URI of a WAV with the spoken text, or null if the built-in voice isn't available.
