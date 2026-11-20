@@ -13,7 +13,6 @@ import {
   Dimensions,
   PixelRatio,
   Image,
-  Keyboard,
   Platform,
   Pressable,
   ScrollView,
@@ -369,25 +368,8 @@ export default function App() {
     }, 350);
     return () => clearTimeout(timer);
   }, [deferredDraft, language]);
-  // While the keyboard is open the hand signs show in one row above it; with the keyboard closed,
-  // the whole text. The switch waits a moment after the keyboard closes: pressing Enter to speak
-  // also closes it, and redrawing the hand signs then would compete with starting the voice.
-  const [keyboardOpen, setKeyboardOpen] = useState(false);
-  useEffect(() => {
-    let hideTimer: ReturnType<typeof setTimeout> | undefined;
-    const shown = Keyboard.addListener('keyboardDidShow', () => {
-      if (hideTimer) clearTimeout(hideTimer);
-      setKeyboardOpen(true);
-    });
-    const hidden = Keyboard.addListener('keyboardDidHide', () => {
-      if (hideTimer) clearTimeout(hideTimer);
-      hideTimer = setTimeout(() => setKeyboardOpen(false), 400);
-    });
-    return () => { shown.remove(); hidden.remove(); if (hideTimer) clearTimeout(hideTimer); };
-  }, []);
   // Every typed word gets hand signs (up to maxTypedSignLetters letters).
   const typedSigns = useMemo(() => firstLetters(deferredDraft, maxTypedSignLetters), [deferredDraft]);
-  const typedStripRef = useRef<ComponentRef<typeof ScrollView>>(null);
   const [speechError, setSpeechError] = useState<string | null>(null);
   // The phone's Google voice sounds natural like English; the built-in voice works on every phone.
   const [filipinoVoice, setFilipinoVoice] = useState<FilipinoVoiceChoice>('phone');
@@ -1168,8 +1150,6 @@ export default function App() {
     : categories.find((category) => category.slug === selectedCategory)?.name ?? null;
 
   // Hand-sign size on the Speak screen (full width, same look as the cards).
-  const typedSignWidth = width - 32 - 2 * 10;
-  const typedSignSize = Math.max(28, Math.min(40, Math.floor((typedSignWidth + 2) / 8) - 2));
 
   // One wide card per row on phones (hand signs fit in one neat row), two side by side on tablets.
   // Cards in columns: two on phones, three on tablets.
@@ -1182,16 +1162,33 @@ export default function App() {
   const accentFor = useStableCallback((message: CommunicationMessage) =>
     message.is_emergency ? palette.coral : categoryColor(message.category?.slug));
   // The card whose hand signs are shown big (opened by tapping a card).
-  const [signCard, setSignCard] = useState<CommunicationMessage | null>(null);
+  // The hand-sign panel: a tapped card's word, or the text typed on the Speak screen.
+  type SignSheet = { title: string | null; text: string | null; signs: string; shortened: boolean; color: string; speak: () => void };
+  const [signSheet, setSignSheet] = useState<SignSheet | null>(null);
   const speakMessage = useStableCallback((message: CommunicationMessage) => {
     speak(message);
-    // The hand-sign panel opens just after the voice has started, so drawing it never delays the voice.
-    setTimeout(() => setSignCard(message), 120);
+    const title = message.title ?? message.message_text ?? '';
+    const sentence = message.title && message.message_text !== message.title ? message.message_text : null;
+    // The panel opens just after the voice has started, so drawing it never delays the voice.
+    setTimeout(() => setSignSheet({ title, text: sentence, signs: title, shortened: false, color: accentFor(message), speak: () => speak(message) }), 120);
   });
-  const signCardTitle = signCard ? signCard.title ?? signCard.message_text ?? '' : '';
-  const signCardSentence = signCard && signCard.title && signCard.message_text !== signCard.title ? signCard.message_text : null;
+  const showTypedSigns = () => {
+    const phrase = speechDraft.trim();
+    if (!typedSigns.text) return;
+    setSignSheet({
+      title: null,
+      text: phrase,
+      signs: typedSigns.text,
+      shortened: typedSigns.shortened,
+      color: palette.brand,
+      speak: () => void speakText(phrase, detectSpeechVoice(phrase, language)),
+    });
+  };
   const signSheetWidth = width - 2 * 16 - 2 * 20 - 2 * 12;
-  const signSheetSize = fitSignSize(signCardTitle, signSheetWidth, Math.round(height * 0.42), 72);
+  // A card's word: as big as fits. Typed text: a comfortable size, scrolling when long.
+  const signSheetSize = signSheet?.title
+    ? fitSignSize(signSheet.signs, signSheetWidth, Math.round(height * 0.42), 72)
+    : Math.max(30, Math.min(48, Math.floor((signSheetWidth + 2) / 6) - 2));
   const removeMessage = useStableCallback((message: CommunicationMessage) => {
     if (message.uuid.startsWith('custom:')) void removeCustomWord(message.uuid.slice('custom:'.length));
     else void hideMessage(message);
@@ -1338,23 +1335,8 @@ export default function App() {
               returnKeyType="send"
               submitBehavior="blurAndSubmit"
               onSubmitEditing={speakDraft}
-              style={[styles.padInput, height < 700 && styles.padInputCompact, keyboardOpen && typedSigns.text ? styles.padInputWithSigns : null]}
+              style={[styles.padInput, height < 700 && styles.padInputCompact]}
             />
-            {/* While typing: hand signs for every word in one row right under the text, scrolled so
-                the newest letters are always visible above the keyboard. */}
-            {keyboardOpen && typedSigns.text ? (
-              <View style={styles.typedSignsPanel}>
-                <ScrollView
-                  ref={typedStripRef}
-                  horizontal
-                  showsHorizontalScrollIndicator={false}
-                  keyboardShouldPersistTaps="handled"
-                  onContentSizeChange={() => typedStripRef.current?.scrollToEnd({ animated: false })}
-                >
-                  <SignWord text={typedSigns.text} size={Math.min(typedSignSize, 30)} oneLine />
-                </ScrollView>
-              </View>
-            ) : null}
             <View style={styles.padToolbar}>
               {speechDraft.trim() ? (
                 <View style={styles.voicePill}>
@@ -1398,19 +1380,17 @@ export default function App() {
           </Pressable>
           {speechError ? <Text accessibilityRole="alert" style={styles.errorText}>{speechError}</Text> : null}
 
-          {/* Done typing: hand signs for every word, below the Speak button. */}
-          {!keyboardOpen && typedSigns.text ? (
-            <View style={styles.typedSignsFull}>
-              <View style={styles.quickHeader}>
-                <Text style={styles.sectionLabel}>{t.handSigns}</Text>
-                {typedSigns.shortened ? <Text style={styles.quickHint}>{t.firstLetters(maxTypedSignLetters)}</Text> : null}
-              </View>
-              <SignWord
-                text={typedSigns.text}
-                size={typedSignSize}
-                maxPerLine={signLettersPerLine(typedSignWidth, typedSignSize)}
-              />
-            </View>
+          {/* Hand signs of the typed text, on request (a long text made the screen very long). */}
+          {typedSigns.text ? (
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel={t.showHandSigns}
+              onPress={showTypedSigns}
+              style={({ pressed }) => [styles.signsButton, pressed && styles.tilePressed]}
+            >
+              <Ionicons name="hand-left-outline" size={20} color={palette.brand} />
+              <Text style={styles.signsButtonText}>{t.showHandSigns}</Text>
+            </Pressable>
           ) : null}
 
           {/* Recently said */}
@@ -1764,47 +1744,49 @@ export default function App() {
 
       {/* A tapped card's hand signs, big, in a panel from the bottom. */}
       <Modal
-        visible={signCard !== null}
+        visible={signSheet !== null}
         transparent
         animationType="slide"
         statusBarTranslucent
-        onRequestClose={() => setSignCard(null)}
+        onRequestClose={() => setSignSheet(null)}
       >
         <View style={styles.signSheetBackdrop}>
-          <Pressable accessibilityRole="button" accessibilityLabel={t.close} style={styles.signSheetDismiss} onPress={() => setSignCard(null)} />
-          {signCard ? (
+          <Pressable accessibilityRole="button" accessibilityLabel={t.close} style={styles.signSheetDismiss} onPress={() => setSignSheet(null)} />
+          {signSheet ? (
             <View style={[styles.signSheet, { paddingBottom: 16 + bottomInset }]}>
-              <View style={[styles.signSheetStripe, { backgroundColor: accentFor(signCard) }]} />
+              <View style={[styles.signSheetStripe, { backgroundColor: signSheet.color }]} />
               <View style={styles.signSheetHeader}>
                 <View style={styles.signSheetHeading}>
                   <Text style={styles.sectionLabel}>{t.handSigns}</Text>
-                  <Text accessibilityRole="header" style={styles.signSheetTitle}>{signCardTitle}</Text>
-                  {signCardSentence ? <Text style={styles.signSheetSentence}>{signCardSentence}</Text> : null}
+                  {signSheet.title ? <Text accessibilityRole="header" style={styles.signSheetTitle}>{signSheet.title}</Text> : null}
+                  {signSheet.text ? <Text numberOfLines={3} style={styles.signSheetSentence}>{signSheet.text}</Text> : null}
+                  {signSheet.shortened ? <Text style={styles.quickHint}>{t.firstLetters(maxTypedSignLetters)}</Text> : null}
                 </View>
                 <Pressable
                   accessibilityRole="button"
                   accessibilityLabel={t.close}
                   hitSlop={8}
-                  onPress={() => setSignCard(null)}
+                  onPress={() => setSignSheet(null)}
                   style={({ pressed }) => [styles.signSheetClose, pressed && styles.pressed]}
                 >
                   <Ionicons name="close" size={24} color={palette.ink} />
                 </Pressable>
               </View>
-              <View style={styles.signSheetSigns}>
+              {/* Long text scrolls inside the panel. */}
+              <ScrollView style={[styles.signSheetSigns, { maxHeight: Math.round(height * 0.5) }]} contentContainerStyle={styles.signSheetSignsContent}>
                 {signSheetSize > 0 ? (
                   <SignWord
-                    text={signCardTitle}
+                    text={signSheet.signs}
                     size={signSheetSize}
                     maxPerLine={signLettersPerLine(signSheetWidth, signSheetSize)}
                   />
                 ) : null}
-              </View>
+              </ScrollView>
               <Pressable
                 accessibilityRole="button"
                 accessibilityLabel={t.speakAgain}
-                onPress={() => speak(signCard)}
-                style={({ pressed }) => [styles.speakButton, { backgroundColor: accentFor(signCard) }, pressed && styles.tilePressed]}
+                onPress={signSheet.speak}
+                style={({ pressed }) => [styles.speakButton, { backgroundColor: signSheet.color }, pressed && styles.tilePressed]}
               >
                 <Ionicons name="volume-high" size={22} color={palette.white} />
                 <Text style={styles.speakButtonText}>{t.speakAgain}</Text>
@@ -2236,9 +2218,7 @@ const styles = StyleSheet.create({
   clearButton: { flexDirection: 'row', alignItems: 'center', gap: 4, minHeight: 36, paddingHorizontal: 10, borderRadius: 18, backgroundColor: palette.canvas },
   clearButtonText: { color: palette.inkSoft, fontFamily: fonts.bold, fontSize: 13 },
   recentBlock: { gap: 8 },
-  typedSignsPanel: { marginHorizontal: 12, marginBottom: 10, backgroundColor: palette.canvas, borderRadius: 14, paddingHorizontal: 8, paddingVertical: 6 },
-  padInputWithSigns: { minHeight: 56 },
-  typedSignsFull: { gap: 8, backgroundColor: palette.surface, borderRadius: 20, borderWidth: 1, borderColor: palette.line, paddingHorizontal: 10, paddingVertical: 14 },
+
   recentList: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
   recentChip: { maxWidth: '100%', flexDirection: 'row', alignItems: 'center', gap: 6, minHeight: 44, paddingHorizontal: 14, borderRadius: 22, backgroundColor: palette.surface, borderWidth: 1, borderColor: palette.line },
   recentChipText: { flexShrink: 1, color: palette.ink, fontFamily: fonts.bold, fontSize: 15 },
@@ -2352,5 +2332,8 @@ const styles = StyleSheet.create({
   signSheetTitle: { color: palette.ink, fontFamily: fonts.bold, fontSize: 28, lineHeight: 34, letterSpacing: -0.5 },
   signSheetSentence: { color: palette.inkSoft, fontFamily: fonts.regular, fontSize: 17, lineHeight: 23 },
   signSheetClose: { width: 44, height: 44, borderRadius: 22, alignItems: 'center', justifyContent: 'center', backgroundColor: palette.canvas },
-  signSheetSigns: { alignItems: 'center', justifyContent: 'center', paddingVertical: 16, paddingHorizontal: 12, borderRadius: 20, backgroundColor: palette.canvas },
+  signSheetSigns: { flexGrow: 0, borderRadius: 20, backgroundColor: palette.canvas },
+  signSheetSignsContent: { alignItems: 'center', justifyContent: 'center', paddingVertical: 16, paddingHorizontal: 12 },
+  signsButton: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, minHeight: 52, borderRadius: 18, borderWidth: 1.5, borderColor: palette.brand, backgroundColor: palette.brandSoft },
+  signsButtonText: { color: palette.brand, fontFamily: fonts.bold, fontSize: 17 },
 });
