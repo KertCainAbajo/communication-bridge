@@ -27,7 +27,8 @@
       "expo-audio",
       "./plugins/with-bundled-voice-model",
       "expo-font",
-      "./plugins/with-release-keep-rules"
+      "./plugins/with-release-keep-rules",
+      "./plugins/with-release-signing"
     ]
   }
 }

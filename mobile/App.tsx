@@ -24,7 +24,7 @@ import bisayaPhraseWords from './assets/offline/bisaya-words.json';
 import { offlineSpeech } from './offlineSpeech';
 import { createTranslator } from './translation';
 import { normalizeSpeechKey, prepareForEnglishVoice } from './speechText';
-import { SignWord } from './signLanguage';
+import { evenLines, SignWord } from './signLanguage';
 import { FadeIn, SlideUp, Toast, type ToastMessage } from './motion';
 import { downloadTranslator, isTranslatorAvailable, isTranslatorReady, translateOffline } from './modules/offline-translator';
 import { checkBuiltInVoiceHealth, synthesizeWithBuiltInVoice } from './builtInVoice';
@@ -1149,6 +1149,10 @@ export default function App() {
             <Ionicons name="lock-closed-outline" size={14} color={palette.muted} />
             <Text style={styles.privacyText}>Works without internet. Your text never leaves this phone.</Text>
           </View>
+          {/* Credits required by the licences of the bundled voice and hand drawings. */}
+          <Text style={styles.creditsText}>
+            Built-in voice: Piper Filipino by IhorShevchuk (CC BY-NC-SA 4.0). Hand sign drawings: Wikimedia Commons (public domain).
+          </Text>
         </View>
 
         </FadeIn>
@@ -1466,29 +1470,75 @@ const BoardList = memo(function BoardList({ messages, columnWidth, cardWidth, ac
     return () => clearTimeout(timer);
   }, [messages.length, renderCount]);
 
+  // Cards are placed in separate columns (each card goes to the shortest one), so every card is only
+  // as tall as its own content: no stretched cards with empty space.
+  const columnCount = columnWidth === '48%' ? 2 : 3;
+  const columns = useMemo(() => {
+    const lists: { message: CommunicationMessage; index: number }[][] = Array.from({ length: columnCount }, () => []);
+    const heights = new Array<number>(columnCount).fill(0);
+    messages.slice(0, renderCount).forEach((message, index) => {
+      const shortest = heights.indexOf(Math.min(...heights));
+      lists[shortest].push({ message, index });
+      heights[shortest] += estimateCardHeight(message, cardWidth) + 14;
+    });
+    return lists;
+  }, [messages, renderCount, columnCount, cardWidth]);
+
   return (
     <View style={styles.board}>
-      {messages.slice(0, renderCount).map((message, index) => (
-        <PhraseCard
-          key={message.uuid}
-          message={message}
-          index={index}
-          columnWidth={columnWidth}
-          cardWidth={cardWidth}
-          accentFor={accentFor}
-          onSpeak={onSpeak}
-          onRemove={onRemove}
-        />
+      {columns.map((column, columnIndex) => (
+        <View key={columnIndex} style={styles.boardColumn}>
+          {column.map(({ message, index }) => (
+            <PhraseCard
+              key={message.uuid}
+              message={message}
+              index={index}
+              columnWidth="100%"
+              cardWidth={cardWidth}
+              accentFor={accentFor}
+              onSpeak={onSpeak}
+              onRemove={onRemove}
+            />
+          ))}
+        </View>
       ))}
     </View>
   );
 });
 
+// A rough card height (in dp) from its text and hand signs, used only to keep the columns even.
+function estimateCardHeight(message: CommunicationMessage, cardWidth: number): number {
+  const inner = cardWidth - 2 * 14;
+  const title = message.title ?? message.message_text ?? '';
+  const titleLines = Math.max(1, Math.ceil((title.length * 11) / Math.max(40, inner - 50)));
+  let height = 2 * 14 + titleLines * 24 + (message.is_emergency ? 18 : 0);
+  if (message.title && message.message_text && message.message_text !== message.title) {
+    height += 10 + Math.min(3, Math.ceil((message.message_text.length * 8.5) / inner)) * 22;
+  }
+  const signWidth = inner - 2 * 8;
+  const size = signSizeFor(title, signWidth);
+  const perLine = signLettersPerLine(signWidth, size);
+  const signRows = title.split(/\s+/)
+    .map((word) => [...word.replace(/[^a-zñ]/gi, '')])
+    .filter((letters) => letters.length > 0)
+    .reduce((rows, letters) => rows + evenLines(letters, perLine).length, 0);
+  if (signRows > 0) height += 10 + 20 + signRows * (size + Math.round(size * 0.36) * 1.4 + 6);
+  return height + 10 + 36;
+}
+
+// How many hand signs of this size fit on one line of the card.
+function signLettersPerLine(availableWidth: number, size: number): number {
+  return Math.max(1, Math.floor((availableWidth + 2) / (size + 2)));
+}
+
 // Hand-sign size so the longest word fits on one line of the card (words wrap only between words).
 function signSizeFor(text: string, availableWidth: number): number {
   const longestWord = Math.max(1, ...text.split(/\s+/).map((word) => word.replace(/[^a-zñ]/gi, '').length));
-  // Each letter takes its size plus a 2 px gap; long words use smaller signs, short ones stay moderate.
-  return Math.max(12, Math.min(24, Math.floor(availableWidth / longestWord) - 3));
+  // Big, clear hands: at most 3 letters per line, and longer words split into even lines
+  // (HEL/LO, HUN/GRY, QUE/ST/ION) so no letter sits alone on a line.
+  const lines = Math.ceil(longestWord / 3);
+  const lettersPerLine = Math.ceil(longestWord / lines);
+  return Math.max(30, Math.min(52, Math.floor(availableWidth / lettersPerLine) - 4));
 }
 
 // A soft tint of a category colour (for the category tag).
@@ -1506,7 +1556,8 @@ const PhraseCard = memo(function PhraseCard({ message, index, columnWidth, cardW
   const accent = accentFor(message);
   const title = message.title ?? message.message_text ?? '';
   const spokenText = message.message_text ?? message.title ?? 'message';
-  const signSize = signSizeFor(title, cardWidth - 2 * 14 - 2 * 10);
+  const signWidth = cardWidth - 2 * 14 - 2 * 8;
+  const signSize = signSizeFor(title, signWidth);
   return (
     <FadeIn delay={Math.min(index, 8) * 45} style={{ width: columnWidth }}>
       <Pressable
@@ -1535,7 +1586,7 @@ const PhraseCard = memo(function PhraseCard({ message, index, columnWidth, cardW
 
         {/* The card's word in sign language (fingerspelled), made automatically for any word. */}
         <View style={[styles.signPanel, message.is_emergency && styles.signPanelEmergency]}>
-          <SignWord text={title} size={signSize} />
+          <SignWord text={title} size={signSize} maxPerLine={signLettersPerLine(signWidth, signSize)} />
         </View>
 
         <View style={styles.phraseFooter}>
@@ -1758,6 +1809,7 @@ const styles = StyleSheet.create({
   segmentTextActive: { color: palette.white },
   privacyRow: { flexDirection: 'row', alignItems: 'center', gap: 6 },
   privacyText: { flex: 1, color: palette.muted, fontFamily: fonts.regular, fontSize: 12 },
+  creditsText: { color: palette.muted, fontFamily: fonts.regular, fontSize: 11, lineHeight: 16, textAlign: 'center' },
 
   searchBox: { flexDirection: 'row', alignItems: 'center', gap: 10, marginHorizontal: 16, marginTop: 20, minHeight: 54, paddingHorizontal: 16, backgroundColor: palette.surface, borderRadius: 18, borderWidth: 1, borderColor: palette.line },
   searchInput: { flex: 1, color: palette.ink, fontFamily: fonts.regular, fontSize: 17, paddingVertical: 12 },
@@ -1807,8 +1859,9 @@ const styles = StyleSheet.create({
   emptyIcon: { width: 64, height: 64, borderRadius: 32, backgroundColor: palette.brandSoft, alignItems: 'center', justifyContent: 'center' },
   emptyTitle: { color: palette.ink, fontFamily: fonts.bold, fontSize: 18 },
 
-  board: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between', rowGap: 14, paddingHorizontal: 16 },
-  phraseCard: { flex: 1, backgroundColor: palette.surface, borderRadius: 24, padding: 14, gap: 10, borderWidth: 1, borderColor: palette.line, ...cardShadow },
+  board: { flexDirection: 'row', alignItems: 'flex-start', gap: 12, paddingHorizontal: 16 },
+  boardColumn: { flex: 1, gap: 14 },
+  phraseCard: { backgroundColor: palette.surface, borderRadius: 24, padding: 14, gap: 10, borderWidth: 1, borderColor: palette.line, ...cardShadow },
   phraseCardEmergency: { backgroundColor: '#FFF7F5', borderColor: '#F5CDC8' },
   cardPressed: { transform: [{ scale: 0.98 }], opacity: 0.92 },
   phraseHead: { flexDirection: 'row', alignItems: 'flex-start', gap: 8 },
@@ -1818,7 +1871,7 @@ const styles = StyleSheet.create({
   emergencyTagText: { color: palette.coral, fontFamily: fonts.bold, fontSize: 11, letterSpacing: 1 },
   phraseTitle: { color: palette.ink, fontFamily: fonts.bold, fontSize: 20, lineHeight: 24, letterSpacing: -0.3 },
   phraseText: { color: palette.inkSoft, fontFamily: fonts.regular, fontSize: 15, lineHeight: 20 },
-  signPanel: { backgroundColor: palette.canvas, borderRadius: 16, paddingHorizontal: 10, paddingVertical: 10 },
+  signPanel: { backgroundColor: palette.canvas, borderRadius: 16, paddingHorizontal: 8, paddingVertical: 10 },
   signPanelEmergency: { backgroundColor: palette.coralSoft },
   phraseFooter: { flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 'auto' },
   categoryTag: { flexShrink: 1, flexDirection: 'row', alignItems: 'center', gap: 6, minWidth: 0, borderRadius: 999, paddingHorizontal: 10, paddingVertical: 6 },

@@ -31,8 +31,22 @@ export function fingerspell(text: string): SignLetter[][] {
     .filter((word) => word.length > 0);
 }
 
+// Splits a word into lines of at most `maxPerLine` letters, as even as possible
+// (HELP → HE/LP, UNDERSTAND → UNDE/RST/AND) so no letter is left alone on a line.
+export function evenLines<T>(letters: T[], maxPerLine: number): T[][] {
+  const lineCount = Math.max(1, Math.ceil(letters.length / Math.max(1, maxPerLine)));
+  const lines: T[][] = [];
+  let start = 0;
+  for (let line = 0; line < lineCount; line += 1) {
+    const length = Math.ceil((letters.length - start) / (lineCount - line));
+    lines.push(letters.slice(start, start + length));
+    start += length;
+  }
+  return lines;
+}
+
 // Memoised: the hand signs only redraw when the word changes.
-export const SignWord = memo(function SignWord({ text, size = 26 }: { text: string; size?: number }) {
+export const SignWord = memo(function SignWord({ text, size = 26, maxPerLine = 99 }: { text: string; size?: number; maxPerLine?: number }) {
   const words = fingerspell(text);
   if (words.length === 0) return null;
   const spelled = words.map((word) => word.map((letter) => letter.label).join(' ')).join(', ');
@@ -41,10 +55,14 @@ export const SignWord = memo(function SignWord({ text, size = 26 }: { text: stri
     <View accessible accessibilityLabel={`Sign language fingerspelling: ${spelled}`} style={styles.words}>
       {words.map((word, wordIndex) => (
         <View key={wordIndex} style={styles.word}>
-          {word.map((letter, letterIndex) => (
-            <View key={letterIndex} style={styles.letter}>
-              <Image source={letter.image} style={{ width: size, height: size }} resizeMode="contain" />
-              <Text style={[styles.label, { fontSize: Math.max(8, Math.round(size * 0.36)) }]}>{letter.label}</Text>
+          {evenLines(word, maxPerLine).map((line, lineIndex) => (
+            <View key={lineIndex} style={styles.line}>
+              {line.map((letter, letterIndex) => (
+                <View key={letterIndex} style={styles.letter}>
+                  <Image source={letter.image} style={{ width: size, height: size }} resizeMode="contain" />
+                  <Text style={[styles.label, { fontSize: Math.max(8, Math.round(size * 0.36)) }]}>{letter.label}</Text>
+                </View>
+              ))}
             </View>
           ))}
         </View>
@@ -55,8 +73,9 @@ export const SignWord = memo(function SignWord({ text, size = 26 }: { text: stri
 
 const styles = StyleSheet.create({
   words: { width: '100%', flexDirection: 'row', flexWrap: 'wrap', columnGap: 10, rowGap: 6 },
-  // Long words wrap onto the next line instead of running past the card.
-  word: { maxWidth: '100%', flexDirection: 'row', flexWrap: 'wrap', gap: 2 },
+  // Long words continue on the next line (split evenly) instead of running past the card.
+  word: { maxWidth: '100%', gap: 4 },
+  line: { flexDirection: 'row', gap: 2 },
   letter: { alignItems: 'center' },
   label: { color: '#475569', fontSize: 10, fontWeight: '800', marginTop: 1 },
 });
