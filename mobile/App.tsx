@@ -16,6 +16,8 @@ import {
   Platform,
   Pressable,
   ScrollView,
+  type NativeScrollEvent,
+  type NativeSyntheticEvent,
   StatusBar as RNStatusBar,
   StyleSheet,
   Text,
@@ -1182,6 +1184,12 @@ export default function App() {
   // True when the signs don't fit, so the hint keeps its space (the panel doesn't jump when it hides).
   const [signsOverflow, setSignsOverflow] = useState(false);
   const signsScroll = useRef({ view: 0, content: 0, offset: 0 });
+  const onSignsScroll = ({ nativeEvent }: NativeSyntheticEvent<NativeScrollEvent>) => {
+    signsScroll.current.offset = nativeEvent.contentOffset.y;
+    signsScroll.current.view = nativeEvent.layoutMeasurement.height;
+    signsScroll.current.content = nativeEvent.contentSize.height;
+    updateSignsMoreBelow();
+  };
   const updateSignsMoreBelow = () => {
     const { view, content, offset } = signsScroll.current;
     const more = view > 0 && content - view - offset > 12;
@@ -1780,16 +1788,19 @@ export default function App() {
                 </Pressable>
               </View>
               {/* Long text scrolls inside the panel; a hint below it (never on top of the signs, so no letter is hidden) says so until the end is reached. */}
-              <View style={[styles.signSheetSignsWrap, { maxHeight: Math.round(height * 0.5) }]}>
+              <View style={[styles.signSheetSignsWrap, { maxHeight: Math.round(Math.max(150, Math.min(height * 0.5, height - 380))) }]}>
                 <ScrollView
                   key={signSheet.signs}
                   style={styles.signSheetSigns}
                   contentContainerStyle={styles.signSheetSignsContent}
                   persistentScrollbar
-                  scrollEventThrottle={64}
+                  scrollEventThrottle={32}
                   onLayout={({ nativeEvent }) => { signsScroll.current.view = nativeEvent.layout.height; updateSignsMoreBelow(); }}
                   onContentSizeChange={(_, contentHeight) => { signsScroll.current.content = contentHeight; updateSignsMoreBelow(); }}
-                  onScroll={({ nativeEvent }) => { signsScroll.current.offset = nativeEvent.contentOffset.y; updateSignsMoreBelow(); }}
+                  onScroll={onSignsScroll}
+                  // Android can skip the last throttled scroll event, so the end position is also read when scrolling stops.
+                  onScrollEndDrag={onSignsScroll}
+                  onMomentumScrollEnd={onSignsScroll}
                 >
                   {signSheetSize > 0 ? (
                     <SignWord
