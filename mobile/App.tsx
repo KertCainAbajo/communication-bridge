@@ -1359,13 +1359,15 @@ export default function App() {
               returnKeyType="send"
               submitBehavior="blurAndSubmit"
               onSubmitEditing={speakDraft}
+              // Long text scrolls inside the box (fixed height), so the Speak button stays in view.
+              scrollEnabled
               style={[styles.padInput, height < 700 && styles.padInputCompact]}
             />
             <View style={styles.padToolbar}>
               {speechDraft.trim() ? (
                 <View style={styles.voicePill}>
                   <Ionicons name="volume-medium" size={14} color={palette.brand} />
-                  <Text style={styles.voicePillText}>{t.voicePill(draftLanguageLabel)}</Text>
+                  <Text numberOfLines={1} style={styles.voicePillText}>{t.voicePill(draftLanguageLabel)}</Text>
                 </View>
               ) : (
                 <Text style={styles.padHint}>{t.voiceChosenForYou}</Text>
@@ -2226,8 +2228,8 @@ const styles = StyleSheet.create({
   composerInput: { minHeight: 120, backgroundColor: palette.canvas, borderColor: palette.line, borderWidth: 1, borderRadius: 18, paddingHorizontal: 16, paddingTop: 14, paddingBottom: 14, color: palette.ink, fontFamily: fonts.regular, fontSize: 20, lineHeight: 28, textAlignVertical: 'top' },
   composerInputLarge: { minHeight: 200 },
   composerMeta: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
-  voicePill: { flexDirection: 'row', alignItems: 'center', gap: 6, backgroundColor: palette.brandSoft, borderRadius: 999, paddingHorizontal: 10, paddingVertical: 5 },
-  voicePillText: { color: palette.brand, fontFamily: fonts.bold, fontSize: 13 },
+  voicePill: { flexShrink: 1, flexDirection: 'row', alignItems: 'center', gap: 6, backgroundColor: palette.brandSoft, borderRadius: 999, paddingHorizontal: 10, paddingVertical: 5 },
+  voicePillText: { flexShrink: 1, color: palette.brand, fontFamily: fonts.bold, fontSize: 13 },
   characterCount: { marginLeft: 'auto', color: palette.muted, fontFamily: fonts.regular, fontSize: 13 },
   speakButton: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 10, minHeight: 60, borderRadius: 20, backgroundColor: palette.brand, ...cardShadow },
   speakButtonDisabled: { backgroundColor: '#E4E0D8', shadowOpacity: 0, elevation: 0 },
@@ -2236,9 +2238,9 @@ const styles = StyleSheet.create({
   speakButtonTextDisabled: { color: palette.muted },
   speakSection: { paddingHorizontal: 16, marginTop: 24, gap: 14 },
   pad: { backgroundColor: palette.surface, borderRadius: 24, borderWidth: 1, borderColor: palette.line, ...cardShadow },
-  padInputCompact: { minHeight: 120 },
-  padInput: { minHeight: 210, paddingHorizontal: 20, paddingTop: 18, paddingBottom: 12, color: palette.ink, fontFamily: fonts.regular, fontSize: 24, lineHeight: 32, textAlignVertical: 'top' },
-  padToolbar: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingHorizontal: 14, paddingVertical: 10, borderTopWidth: 1, borderTopColor: palette.line },
+  padInputCompact: { minHeight: 120, maxHeight: 150 },
+  padInput: { minHeight: 210, maxHeight: 240, paddingHorizontal: 20, paddingTop: 18, paddingBottom: 12, color: palette.ink, fontFamily: fonts.regular, fontSize: 24, lineHeight: 32, textAlignVertical: 'top' },
+  padToolbar: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingHorizontal: 12, paddingVertical: 10, borderTopWidth: 1, borderTopColor: palette.line },
   padHint: { flex: 1, color: palette.muted, fontFamily: fonts.regular, fontSize: 13 },
   clearButton: { flexDirection: 'row', alignItems: 'center', gap: 4, minHeight: 36, paddingHorizontal: 10, borderRadius: 18, backgroundColor: palette.canvas },
   clearButtonText: { color: palette.inkSoft, fontFamily: fonts.bold, fontSize: 13 },
