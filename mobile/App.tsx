@@ -1179,11 +1179,15 @@ export default function App() {
   const [signSheet, setSignSheet] = useState<SignSheet | null>(null);
   // True while more hand signs are hidden below in the panel (shows the "scroll down" hint).
   const [signsMoreBelow, setSignsMoreBelow] = useState(false);
+  // True when the signs don't fit, so the hint keeps its space (the panel doesn't jump when it hides).
+  const [signsOverflow, setSignsOverflow] = useState(false);
   const signsScroll = useRef({ view: 0, content: 0, offset: 0 });
   const updateSignsMoreBelow = () => {
     const { view, content, offset } = signsScroll.current;
     const more = view > 0 && content - view - offset > 12;
     setSignsMoreBelow((current) => (current === more ? current : more));
+    const overflow = view > 0 && content - view > 12;
+    setSignsOverflow((current) => (current === overflow ? current : overflow));
   };
   const speakMessage = useStableCallback((message: CommunicationMessage) => {
     speak(message);
@@ -1773,7 +1777,7 @@ export default function App() {
                   <Ionicons name="close" size={24} color={palette.ink} />
                 </Pressable>
               </View>
-              {/* Long text scrolls inside the panel; a hint at the bottom says so until the end is reached. */}
+              {/* Long text scrolls inside the panel; a hint below it (never on top of the signs, so no letter is hidden) says so until the end is reached. */}
               <View style={[styles.signSheetSignsWrap, { maxHeight: Math.round(height * 0.5) }]}>
                 <ScrollView
                   key={signSheet.signs}
@@ -1793,15 +1797,15 @@ export default function App() {
                     />
                   ) : null}
                 </ScrollView>
-                {signsMoreBelow ? (
-                  <View pointerEvents="none" style={styles.scrollHint}>
-                    <View style={styles.scrollHintPill}>
-                      <Ionicons name="chevron-down" size={16} color={palette.white} />
-                      <Text style={styles.scrollHintText}>{t.scrollForMore}</Text>
-                    </View>
-                  </View>
-                ) : null}
               </View>
+              {signsOverflow ? (
+                <View pointerEvents="none" style={[styles.scrollHint, !signsMoreBelow && styles.hidden]} importantForAccessibility={signsMoreBelow ? 'auto' : 'no-hide-descendants'}>
+                  <View style={styles.scrollHintPill}>
+                    <Ionicons name="chevron-down" size={16} color={palette.white} />
+                    <Text style={styles.scrollHintText}>{t.scrollForMore}</Text>
+                  </View>
+                </View>
+              ) : null}
               <Pressable
                 accessibilityRole="button"
                 accessibilityLabel={t.speakAgain}
@@ -2350,7 +2354,8 @@ const styles = StyleSheet.create({
   signSheetClose: { width: 44, height: 44, borderRadius: 22, alignItems: 'center', justifyContent: 'center', backgroundColor: palette.canvas },
   signSheetSignsWrap: { overflow: 'hidden', borderRadius: 20, backgroundColor: palette.canvas },
   signSheetSigns: { flexGrow: 0 },
-  scrollHint: { position: 'absolute', left: 0, right: 0, bottom: 0, alignItems: 'center', paddingTop: 18, paddingBottom: 10, backgroundColor: 'rgba(247, 245, 240, 0.85)' },
+  scrollHint: { alignItems: 'center', marginTop: -8 },
+  hidden: { opacity: 0 },
   scrollHintPill: { flexDirection: 'row', alignItems: 'center', gap: 6, paddingHorizontal: 14, paddingVertical: 7, borderRadius: 999, backgroundColor: palette.ink },
   scrollHintText: { color: palette.white, fontFamily: fonts.bold, fontSize: 13 },
   signSheetSignsContent: { alignItems: 'center', justifyContent: 'center', paddingVertical: 16, paddingHorizontal: 12 },
